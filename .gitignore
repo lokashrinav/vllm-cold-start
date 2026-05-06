@@ -1,0 +1,23 @@
+.venv/
+.uv-cache/
+.uv-python/
+__pycache__/
+*.py[cod]
+
+build/
+dist/
+*.egg-info/
+
+.pytest_cache/
+
+analysis/results/
+.claude/
+
+# Reference copies of vLLM source files
+cuda_graph.py
+cudagraph_dispatcher.py
+encoder_cudagraph.py
+gpu_model_runner.py
+
+# Raw benchmark output
+benchmark_output*.txt
