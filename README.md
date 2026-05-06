@@ -38,20 +38,36 @@ The 23s improvement comes from eliminating GPU initialization overhead. The rema
 
 First inference is ~1.4s slower because kernel compilation is deferred. Only the kernels needed for the first request compile, instead of all possible variants compiling upfront.
 
+## Why CUDA graphs are hard to save
+
+A CUDA graph records a sequence of GPU operations at specific memory addresses. "Read weights from address 0xA, multiply with input at address 0xB, write output to address 0xC." Replaying the graph runs the same operations without CPU overhead.
+
+The problem: GPU memory addresses change every time a process starts. Your model's weights land at different addresses on each boot. A saved graph still points to the old addresses. Replay breaks.
+
+## How Foundry solves the address problem
+
+Foundry is a library with an LD_PRELOAD hook intercepting all GPU memory allocations. Foundry forces every allocation through a bump allocator starting at a fixed base address (e.g., 0x10000000000).
+
+First allocation gets the base address. Second gets base + size_of_first. Third gets base + size_of_first + size_of_second. And so on.
+
+PyTorch model initialization is deterministic. Same model, same config, same allocation order. So every tensor lands at the same address on every boot. Saved CUDA graphs point to the right addresses. Replay works.
+
 ## How the integration works
 
-The integration monkey-patches vLLM's initialization pipeline. On the first cold start (save mode), everything runs normally and gets written to disk. On subsequent cold starts (load mode), everything restores from cache.
+The integration monkey-patches vLLM's initialization pipeline in two modes.
 
-Save path (first boot):
-1. Foundry's LD_PRELOAD hook forces all GPU allocations to deterministic addresses via a bump allocator.
-2. vLLM initializes normally. Model loads, memory gets profiled, CUDA graphs get captured.
-3. All profiling results, cursor positions, and CUDA graphs save to disk.
+First boot (save mode):
 
-Load path (subsequent boots):
-1. Same deterministic addressing. Every tensor lands at the same GPU address as the save run.
-2. Profiling is skipped. Saved results return directly, allocator cursor advances to match.
-3. CUDA graphs restore from disk instead of recapturing.
-4. Graph restoration runs in the background during weight download. Zero added latency.
+1. Foundry's hook activates. All GPU allocations go through the bump allocator at fixed addresses.
+2. vLLM initializes normally. The model loads, memory gets profiled, CUDA graphs get captured.
+3. The integration records everything to disk: profiling results, allocator positions, and all CUDA graphs with their kernel binaries.
+
+Subsequent boots (load mode):
+
+1. Foundry's hook activates at the same base address. Every tensor lands at the same spot as the save run.
+2. Memory profiling is skipped. The saved result returns directly. The allocator cursor advances forward to match where profiling would have left off.
+3. CUDA graphs restore from disk instead of recapturing. Foundry rebuilds the graph topology and links each node back to the correct GPU addresses.
+4. The integration starts graph restoration in the background before model weights start downloading. Weight download takes ~66 seconds. Graph restoration takes <1 second. By the time vLLM needs the graphs, they're already done.
 
 See OPTIMIZATIONS.md for a detailed walkthrough of every optimization, including failed attempts.
 
