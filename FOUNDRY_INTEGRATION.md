@@ -95,16 +95,28 @@ The integration has two modes:
     └──────────────┬──────────────────────────────┘
                    │
     ┌──────────────▼──────────────────────────────┐
+    │  Passthrough Recording (non-Foundry allocs) │
+    │  fdry.stop_allocation_region()              │
+    │  fdry.start_passthrough_record()            │
+    └──────────────┬──────────────────────────────┘
+                   │
+    ┌──────────────▼──────────────────────────────┐
     │           vLLM Engine Init                  │
-    │  1. Load model weights (same addresses!)    │
-    │  2. Skip profiling (return saved value)     │
-    │  3. Allocate KV cache (same addresses!)     │
-    │  4. capture_model() → load from disk        │
-    │     - start_graph_builds() → Phase 1+2a     │
-    │     - finish_graph_loads() → Phase 2b+2c    │
-    │     - replay_hook_events → cursor adjust    │
-    │     - cuGraphInstantiate → graph ready      │
-    │  5. First inference uses loaded graphs      │
+    │  1. init_device() → NCCL init (recorded)    │
+    │  2. fdry.resume_allocation_region()          │
+    │  3. Load model weights (same addresses!)    │
+    │  4. determine_available_memory() → run with  │
+    │     Foundry disabled, return saved value     │
+    │  5. Allocate KV cache (same addresses!)     │
+    │  6. capture_model():                        │
+    │     a. NCCL warmup allreduce (if multi-GPU) │
+    │     b. End passthrough recording            │
+    │     c. Match passthrough events (save↔load) │
+    │     d. Patch graph JSON addresses           │
+    │     e. Pre-map non-Foundry addresses        │
+    │     f. fdry.CUDAGraph.load() per graph      │
+    │     g. Direct-populate graph entries         │
+    │  7. First inference uses loaded graphs      │
     └─────────────────────────────────────────────┘
 ```
 
@@ -557,7 +569,7 @@ At load time, the manifest is read first, avoiding the need to re-compute topolo
 
 ## vLLM Integration Layer
 
-The integration monkey-patches three vLLM methods to intercept the graph lifecycle:
+The integration monkey-patches vLLM's initialization pipeline via `patch_vllm_for_foundry()`. Eight patches intercept the graph lifecycle, profiling, and initialization:
 
 ### Patch 0: `GPUModelRunner.profile_cudagraph_memory`
 
@@ -569,61 +581,72 @@ def _skip_profile_cudagraph(self):
     return saved_estimate  # e.g., 230686720 bytes (0.21 GiB)
 ```
 
+In save mode, passthrough recording is paused during profiling (`fdry.pause_passthrough_record()`) to avoid capturing profiling-only allocations, then resumed after.
+
 ### Patch 0b: `Worker.determine_available_memory`
 
-This is the biggest optimization. vLLM's `determine_available_memory` runs a full model forward pass (`profile_run`) just to measure peak GPU memory. For a 7B model, this takes **~16 seconds**. In load mode, we skip it entirely:
+In load mode, we run the original `determine_available_memory` with the Foundry allocator **temporarily disabled** (`fdry.stop_allocation_region()`). This lets cuBLAS workspace initialization and other runtime side effects happen normally with the default CUDA allocator. But we return the **saved** KV cache memory value instead of the freshly-computed one, keeping cursor alignment correct:
 
 ```python
 def _skip_determine(self):
-    # Preallocate remaining region for fast-path cuMemAlloc
-    fdry.preallocate_region(remaining)
-    # Advance cursor to match save-mode position
-    fdry.set_current_alloc_offset(cursor + saved_delta)
-    # Return saved value directly
-    return saved_kv_cache_memory  # e.g., 17,091,788,390 bytes
+    fdry.stop_allocation_region()
+    try:
+        result = _original_determine(self)  # side effects happen
+    finally:
+        fdry.resume_allocation_region()
+    return _saved_kv_mem  # use saved value for cursor alignment
 ```
 
-This replaces ~16s with ~0.5s.
+This ensures runtime libraries initialize their internal state (which matters for graph replay) while still returning the deterministic KV cache value from the save run.
+
+In save mode, the function is instrumented to record `available_kv_cache_memory` and `determine_cursor_delta`.
 
 ### Patch 1: `GPUModelRunner.capture_model`
 
-The `capture_model` patch handles the overall orchestration:
+The core orchestration patch.
 
 **Save mode:**
-1. Records pre-capture allocator offset
-2. Flushes PyTorch caching allocator (`torch.cuda.empty_cache()`)
-3. Calls original `capture_model()` (which iterates batch sizes)
-4. Each batch size triggers `CUDAGraphWrapper.__call__` (Patch 2)
-5. After all graphs captured, `_finalize_save()` writes to disk
+1. Stops extended passthrough recording and captures all events
+2. Records pre-capture allocator offset
+3. Flushes PyTorch caching allocator (`torch.cuda.empty_cache()`)
+4. Calls original `capture_model()` (which iterates batch sizes)
+5. Each batch size triggers `CUDAGraphWrapper.__call__` (Patch 2)
+6. After all graphs captured, `_finalize_save()` writes to disk (graphs, fatbins, metadata, passthrough events)
 
 **Load mode:**
-1. Preallocates remaining GPU VA region (if not already done)
-2. Copies graph files to `/dev/shm` (background pre-copy)
-3. Calls `start_graph_builds()` to begin three-phase loading pipeline
-4. Calls original `capture_model()` which triggers `__call__` per batch size
-5. Each `__call__` returns a pre-loaded graph from `finish_graph_loads()`
+1. NCCL warmup allreduce (if `torch.distributed` is initialized and extended recording is active) — captures NCCL's internal allocations as passthrough events
+2. Stops extended passthrough recording, captures events
+3. Builds address remap table from save/load passthrough events (`_build_passthrough_addr_map`)
+4. Patches graph JSON kernel parameters with remapped addresses (`_patch_graph_json_addresses`)
+5. Pre-maps physical memory at remaining non-Foundry addresses (`_premap_non_foundry_addresses`)
+6. Loads each graph via `fdry.CUDAGraph.load(path, pool)`
+7. Direct-populates `CUDAGraphWrapper.concrete_cudagraph_entries` — bypasses entire capture loop
+
+### Patch 1b: `GPUWorker.compile_or_warm_up_model`
+
+Timing instrumentation in both modes. In load mode, the original function still runs (it calls `capture_model` which is already patched).
+
+### Patch 1b2: Skip warmup passes in capture loop
+
+Safety net for load mode. If any code path still calls `_warmup_and_capture`, reduces work to a single `_dummy_run` pass instead of N warmup passes + capture.
+
+### Patch 1b3: Skip `_dummy_sampler_run`
+
+Skips Triton JIT compilation of sampling kernels (~15s) in load mode. Kernels compile lazily on first inference instead, adding ~1.4s to first request.
 
 ### Patch 2: `CUDAGraphWrapper.__call__`
 
-**Save mode:** Replaces `torch.cuda.CUDAGraph` with `fdry.CUDAGraph`, capturing with Foundry's hook-aware implementation.
+**Save mode:** Replaces `torch.cuda.CUDAGraph` with `fdry.CUDAGraph`, capturing with Foundry's hook-aware implementation. Skips `set_graph_pool_id` because graph pools use `cudaMallocAsync` which bypasses Foundry's `cuMemAlloc_v2` hook. After `fdry.graph().__exit__`, calls `fdry.resume_allocation_region()` because `capture_end()` disables it.
 
-**Load mode:** Instead of capturing, returns the next pre-loaded graph from the three-phase pipeline:
+**Load mode:** Returns the next pre-loaded graph from `state._preloaded_graphs` (populated by Patch 1's loading sequence). Falls back to original capture if cache is exhausted.
 
-```python
-def _foundry_wrapper_call(self, *args, **kwargs):
-    if _is_load_mode:
-        result = state.next_loaded_graph()
-        if result is not None:
-            graph, output = result
-            entry.cudagraph = graph
-            entry.output = output
-            return entry.output
-    # ... save mode capture logic ...
-```
+### Patch 3: Hook `BaseModelLoader.load_model`
+
+Intercepts `load_weights` to inject work before the weight download. Currently used as a passthrough (early preallocation + graph builds disabled for debugging), but the hook point remains for overlapping graph loading with the 66s weight download.
 
 ---
 
-## Profile Skip — Eliminating Memory Profiling
+## Profile Skip — Memory Profiling Optimization
 
 ### What `determine_available_memory` does
 
@@ -650,20 +673,16 @@ During save mode, we wrap `determine_available_memory` to capture:
 - The return value (`available_kv_cache_memory`)
 - The total cursor advancement (`determine_cursor_delta`)
 
-These are saved in the graph cache metadata alongside the graph files.
+The Foundry allocator is temporarily stopped during profiling so cuBLAS and other runtime allocations happen through the default CUDA allocator. This is important because `profile_run` triggers cuBLAS workspace initialization as a side effect.
 
-### Load mode: Skip entirely
+### Load mode: Run with Foundry disabled, return saved value
 
-We replace `determine_available_memory` with a function that:
-1. **Preallocates** the remaining GPU region (so subsequent KV cache allocation uses the fast path)
-2. **Advances** the bump cursor by `determine_cursor_delta` (replicating the cursor effect of profile_run + profile_cudagraph_memory without actually running them)
-3. **Returns** the saved `available_kv_cache_memory` value
+We run the **original** `determine_available_memory` with the Foundry allocator temporarily disabled (`fdry.stop_allocation_region()`). This is necessary because:
+- cuBLAS workspace initialization happens as a side effect of `profile_run`
+- These workspaces get referenced by CUDA graph kernel parameters
+- If they don't exist at graph load time, replay faults (XID 31)
 
-This ensures KV cache allocation happens at the **exact same addresses** as during the save run, because:
-- Same base address (deterministic VMM)
-- Same model weights (same addresses from bump allocator)
-- Same cursor advancement (replayed via `set_current_alloc_offset`)
-- Same available memory value → same number of KV cache blocks → same KV cache size
+But we return the **saved** KV cache memory value, not the freshly-computed one. The saved value ensures KV cache allocation produces the same number of blocks and same addresses as the save run.
 
 ---
 
@@ -802,14 +821,12 @@ After preallocation, all subsequent `cuMemAlloc` calls within the region use the
 
 ### When preallocation happens
 
-| Phase | Without optimization | With determine_available_memory skip |
-|-------|---------------------|--------------------------------------|
+| Phase | Without optimization | With optimization |
+|-------|---------------------|-------------------|
 | Model loading | Slow path (cuMemCreate per alloc) | Slow path |
-| Profile run | Slow path | **SKIPPED** |
-| KV cache | Slow path | **Fast path** (preallocated early) |
-| Graph loading | Fast path (preallocated in capture_model) | Fast path (already preallocated) |
-
-By preallocating inside the skipped `determine_available_memory`, KV cache allocation also benefits from the fast path.
+| Profile run | Slow path | Runs with Foundry disabled (for side effects) |
+| KV cache | Slow path | **Fast path** (preallocated early, if applicable) |
+| Graph loading | Fast path (preallocated in capture_model) | Fast path |
 
 ---
 
@@ -841,6 +858,136 @@ Sampling kernels compile lazily on the first real inference instead, adding ~1s 
 | `compile_or_warm_up_model` | 12-18s | 1.78s |
 | `init_engine` total | 12-18s | 1.79s |
 | First inference latency | 1.22s | 2.22s (+1s) |
+
+---
+
+## Passthrough Recording & Address Patching
+
+### The Problem
+
+Not all GPU allocations go through Foundry's bump allocator. NCCL workspace buffers, cuBLAS handles, and CUDA runtime scratch memory are allocated by libraries that call `cuMemAlloc` on threads where `tls_storage.enabled = false` (Foundry's bump allocator is thread-local). These allocations land at non-deterministic addresses controlled by the CUDA driver.
+
+During CUDA graph capture, kernel parameters encode these addresses. On reload, the addresses are different, and graph replay faults with XID 31 (GPU memory violation).
+
+### Solution: Passthrough Event Recording
+
+Foundry provides passthrough recording APIs that log non-bump-allocator allocations:
+
+```python
+fdry.stop_allocation_region()       # disable bump allocator
+fdry.start_passthrough_record()     # start recording
+# ... init_device, NCCL init, cuBLAS init ...
+fdry.resume_allocation_region()     # re-enable bump allocator
+# extended recording continues through capture_model
+fdry.end_passthrough_record()       # stop recording
+events = fdry.get_passthrough_events()  # list of {source, ptr, size}
+```
+
+### Save Path
+
+1. Before `init_device()`: stop bump allocator, start passthrough recording
+2. `init_device()` runs: NCCL initializes, cuBLAS creates workspace handles
+3. Resume bump allocator, but keep recording active (`_extended_recording = True`)
+4. Recording continues through `capture_model()` to catch post-init allocations
+5. In `_flagged_capture_model`, `fdry.end_passthrough_record()` captures all events
+6. Events saved to `metadata.json` alongside graph files
+
+### Load Path
+
+1. Same recording captures new addresses
+2. `_build_passthrough_addr_map()`: size-based greedy matching
+   - Group load events by size
+   - For each save event, find first unmatched load event with same size
+   - If addresses differ, create `(old_base, old_end, new_base, delta)` tuple
+   - Sort by `old_base` for binary search
+3. `_patch_graph_json_addresses()`: for each graph JSON
+   - Iterate all kernel parameter hex values
+   - Extract 8-byte little-endian integers
+   - Binary search in range table → apply delta if match
+   - Also patches MemsetNode.dst, MemcpyNode.srcDevice/dstDevice
+   - Writes patched JSON to temp file
+4. `_premap_non_foundry_addresses()`: for remaining non-Foundry pointers
+   - Scan all graph JSONs for pointer-sized values outside Foundry region
+   - Filter: must be page-aligned, in plausible GPU address range
+   - Merge into 2MB-aligned ranges
+   - Pre-map via raw CUDA VMM: `cuMemAddressReserve` + `cuMemCreate` + `cuMemMap` + `cuMemSetAccess` (ctypes → libcuda.so)
+5. `_diagnose_unpatched_addresses()`: log any remaining uncovered pointers
+
+### NCCL Warmup
+
+In multi-GPU load mode, NCCL's internal buffers must exist before graph loading. The integration does a warmup allreduce during passthrough recording:
+
+```python
+if state._extended_recording and _is_load_mode:
+    if torch.distributed.is_initialized():
+        warmup = torch.zeros(1024, device=f"cuda:{dev}")
+        torch.distributed.all_reduce(warmup)
+        torch.cuda.synchronize()
+```
+
+This forces NCCL to allocate its workspace buffers while passthrough recording is active, so the addresses are captured and can be matched against save-run events.
+
+---
+
+## Multi-GPU Support (Tensor Parallelism)
+
+### Architecture
+
+Multi-GPU mode (`tensor_parallel_size > 1`) uses `_cached_vllm_init_multi_gpu()`:
+
+1. **Parent process** (no CUDA init):
+   - Computes cache key from model + versions + kwargs
+   - Checks ALL per-rank caches to determine global save/load mode
+   - Patches `GPUWorker.init_device` → `_foundry_init_device`
+   - Sets `disable_custom_all_reduce=True` (forces NCCL path)
+   - Calls `LLM(model, ...)`
+
+2. **Worker subprocesses** (via fork):
+   - `_foundry_init_device()` runs per-rank:
+     - Per-rank cache directory: `{base_dir}/rank_{rank}/`
+     - Loads CUDA modules from hook_archive (load mode)
+     - `setup_foundry_regions()` per-GPU
+     - `patch_vllm_for_foundry()` with rank-specific cache
+     - Starts passthrough recording
+     - Runs original `init_device()` (NCCL init, model architecture creation)
+     - Resumes Foundry allocator, keeps extended recording active
+   - Rest of init uses patched methods (same as single-GPU)
+
+### Global Mode Decision
+
+All ranks must use the same mode (save or load) to avoid NCCL deadlocks. If rank 0 is in save mode (running `profile_run`, which involves NCCL collectives) but rank 1 is in load mode (skipping profiling), the ranks hang waiting for each other.
+
+```python
+def _rank_cache_ready(r: int) -> bool:
+    rank_dir = base_dir / f"rank_{r}"
+    if not (rank_dir / ".save_complete").exists():
+        return False
+    wg_dir = rank_dir / "wrapper_graphs"
+    return wg_dir.exists() and any(wg_dir.glob("graph_*.json"))
+
+global_load_mode = all(_rank_cache_ready(r) for r in range(tp_size))
+```
+
+### Cache Structure (Multi-GPU)
+
+```
+/root/.cache/foundry-graphs/<cache_key>/
+├── rank_0/
+│   ├── .save_complete
+│   ├── metadata.json          # Includes passthrough_events for rank 0
+│   ├── hook_archive/
+│   └── wrapper_graphs/
+│       ├── graph_0.json
+│       ├── graph_0.cugraph
+│       └── ...
+├── rank_1/
+│   ├── .save_complete
+│   ├── metadata.json          # Includes passthrough_events for rank 1
+│   ├── hook_archive/
+│   └── wrapper_graphs/
+│       └── ...
+└── ...
+```
 
 ---
 
@@ -884,10 +1031,11 @@ Total: ~110s (measured, Qwen2.5-7B on A100-40GB)
 
 | Optimization | Saves | Mechanism |
 |-------------|-------|-----------|
-| Skip `profile_run` | ~16s | Return saved `available_kv_cache_memory` |
+| Profile run (run with Foundry disabled) | ~16s | Run for side effects, return saved `available_kv_cache_memory` |
 | Skip `profile_cudagraph_memory` | ~4s | Return saved estimate + advance cursor |
 | Skip `_dummy_sampler_run` | ~15s | Defer sampling kernel JIT to first inference |
 | Graph loading (vs capture) | ~3-9s | Load from .cugraph files instead of capturing |
+| Passthrough addr patching | N/A | Enables correct graph replay with non-deterministic NCCL/cuBLAS addresses |
 | `/dev/shm` pre-copy | ~11s | Overlap file copy with model download |
 | Binary .cugraph format | ~10s | 168-byte fixed nodes, no hex decode |
 | Template sharing | ~5s | 5 templates instead of 35 instantiations |
@@ -902,26 +1050,28 @@ Total: ~110s (measured, Qwen2.5-7B on A100-40GB)
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `foundry/csrc/hook.cpp` | ~3258 | LD_PRELOAD hook: bump allocator, cuMemAlloc interception, allocator event recording/replay, `set_allocation_region`, `preallocate_region`, `replay_hook_events_from_json` |
+| `foundry/csrc/hook.cpp` | ~3258 | LD_PRELOAD hook: bump allocator, cuMemAlloc interception, allocator event recording/replay, passthrough recording, `set_allocation_region`, `preallocate_region` |
 | `foundry/csrc/CUDAGraph.cpp` | ~600 | `capture_begin`, `capture_end`, `analyze_captured_graph`, `save()`, `load()` |
 | `foundry/csrc/CUDAGraphParallel.cpp` | ~2464 | Three-phase loading pipeline: `start_graph_builds_impl`, `finish_graph_loads_impl`, template sharing, topology grouping |
 | `foundry/include/BinaryGraphFormat.h` | ~200 | Binary `.cugraph` format: `FileHeader`, `BinNodeEntry` (168 bytes), section types |
-| `foundry/include/hook.h` | ~54 | Public API: `set_allocation_region`, `preallocate_region`, `get_current_alloc_offset`, etc. |
+| `foundry/include/hook.h` | ~54 | Public API: `set_allocation_region`, `preallocate_region`, `get_current_alloc_offset`, passthrough APIs |
 
 ### vLLM Integration (Python)
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `src/vllm_profile_cache/foundry_graphs.py` | ~1080 | Main integration: `patch_vllm_for_foundry`, `cached_vllm_init_with_foundry`, `_FoundryPatchState`, profile skip, `/dev/shm` pre-copy, graph save/load orchestration |
-| `profiling/modal_foundry_benchmark.py` | ~800 | A/B benchmark on Modal: baseline vs save vs load, subprocess with proper LD_PRELOAD, timing comparison |
+| `src/vllm_profile_cache/foundry_graphs.py` | ~1608 | Main integration: 8 monkey-patches, passthrough recording, address patching (binary search + graph JSON rewrite), non-Foundry address pre-mapping (ctypes VMM), multi-GPU support, NCCL warmup, SIGABRT handler, `/dev/shm` pre-copy |
+| `profiling/modal_foundry_benchmark.py` | ~807 | A/B/C benchmark on Modal (single GPU): baseline vs save vs load |
+| `profiling/modal_foundry_multi_gpu_benchmark.py` | ~422 | A/B/C benchmark on Modal (multi-GPU, tp=2) |
 
-### Cache Directory Layout
+### Cache Directory Layout (Single GPU)
 
 ```
 /root/.cache/foundry-graphs/<cache_key>/
 ├── .save_complete                    # Marker file
 ├── metadata.json                     # Model ID, region info, cursor positions,
-│                                     # saved profile estimates, KV cache memory
+│                                     # saved profile estimates, KV cache memory,
+│                                     # passthrough_events (non-Foundry allocs)
 ├── hook_archive/
 │   ├── fatbin_entrypoint_packed.txt  # Module entrypoint → fatbin mapping
 │   └── fatbin_image_packed.img       # All CUDA fatbin images (kernels)
@@ -934,4 +1084,25 @@ Total: ~110s (measured, Qwen2.5-7B on A100-40GB)
     ├── ...
     ├── graph_34.json
     └── graph_34.cugraph
+```
+
+### Cache Directory Layout (Multi-GPU)
+
+```
+/root/.cache/foundry-graphs/<cache_key>/
+├── rank_0/
+│   ├── .save_complete
+│   ├── metadata.json                 # Per-rank passthrough_events
+│   ├── hook_archive/
+│   └── wrapper_graphs/
+│       ├── graph_0.json
+│       ├── graph_0.cugraph
+│       └── ...
+├── rank_1/
+│   ├── .save_complete
+│   ├── metadata.json
+│   ├── hook_archive/
+│   └── wrapper_graphs/
+│       └── ...
+└── ...
 ```

@@ -1,6 +1,6 @@
 # vllm-cold-start
 
-Cuts ~30s off vLLM cold starts by caching GPU initialization work across container boots.
+Cuts ~30s off vLLM cold starts by caching GPU initialization work across container boots. Supports single-GPU and multi-GPU (tensor parallelism) deployments.
 
 ## The problem
 
@@ -16,13 +16,17 @@ Every time vLLM starts on a fresh container, the same expensive GPU initializati
 
 Caches all three across cold starts so they only happen once.
 
-- Memory profiling: saves results and replays allocator state on subsequent boots. No more running a fresh forward pass every time.
+- Memory profiling: runs the profiling pass with Foundry's allocator disabled (so side effects like cuBLAS workspace init still happen), but returns the saved KV cache memory value from the first run. Cursor alignment stays correct.
 - CUDA graph capture: serializes graphs to disk using Foundry's deterministic GPU addressing. Restores them instead of recapturing.
 - Kernel compilation: defers to lazy JIT. Only the kernels needed on first inference compile, not every possible variant.
 
-## The hard part
+## The hard parts
 
-Getting graph restoration to run in the background during the 66-second weight download took the most work. The integration hooks into vLLM's init pipeline where GPU addresses are finalized but weights haven't started downloading. The graph builder gets 66 seconds of free overlap time. By the time vLLM needs the graphs, they're already ready.
+**Address determinism.** Foundry's bump allocator makes model weights and KV cache land at the same GPU addresses every boot. But not everything goes through Foundry. NCCL workspaces, cuBLAS handles, and other runtime allocations bypass the bump allocator and land at unpredictable addresses. These get baked into CUDA graph kernel parameters during capture. On reload, those addresses point to unmapped memory.
+
+The integration solves this with a passthrough recording system. During the save run, Foundry records every non-bump-allocator allocation (source, address, size). On load, the same recording captures the new addresses. A size-based greedy matcher pairs save/load events, then binary-searches through every kernel parameter in every graph JSON to patch old addresses to new ones. For any remaining non-Foundry addresses not covered by passthrough matching, raw CUDA VMM APIs pre-map physical memory at those locations.
+
+**Multi-GPU.** With tensor parallelism, each GPU rank runs in a separate subprocess. Foundry setup is deferred to each worker via a patched `init_device`. All ranks must agree on save vs. load mode before any NCCL collective fires, or the ranks deadlock. The parent process checks all per-rank caches before spawning workers and passes a global mode flag.
 
 ## Results
 
@@ -52,6 +56,8 @@ First allocation gets the base address. Second gets base + size_of_first. Third 
 
 PyTorch model initialization is deterministic. Same model, same config, same allocation order. So every tensor lands at the same address on every boot. Saved CUDA graphs point to the right addresses. Replay works.
 
+But not all allocations go through Foundry's bump allocator. NCCL, cuBLAS, and other CUDA runtime libraries allocate their own workspace buffers through the default CUDA allocator. These addresses are non-deterministic. The integration handles them with passthrough event recording and address patching (see FOUNDRY_INTEGRATION.md for details).
+
 ## How the integration works
 
 The integration monkey-patches vLLM's initialization pipeline in two modes.
@@ -59,17 +65,19 @@ The integration monkey-patches vLLM's initialization pipeline in two modes.
 First boot (save mode):
 
 1. Foundry's hook activates. All GPU allocations go through the bump allocator at fixed addresses.
-2. vLLM initializes normally. The model loads, memory gets profiled, CUDA graphs get captured.
-3. The integration records everything to disk: profiling results, allocator positions, and all CUDA graphs with their kernel binaries.
+2. Passthrough recording starts: non-bump allocations (NCCL, cuBLAS) are logged with their source, address, and size.
+3. vLLM initializes normally. The model loads, memory gets profiled, CUDA graphs get captured.
+4. The integration records everything to disk: profiling results, allocator positions, passthrough events, and all CUDA graphs with their kernel binaries.
 
 Subsequent boots (load mode):
 
-1. Foundry's hook activates at the same base address. Every tensor lands at the same spot as the save run.
-2. Memory profiling is skipped. The saved result returns directly. The allocator cursor advances forward to match where profiling would have left off.
-3. CUDA graphs restore from disk instead of recapturing. Foundry rebuilds the graph topology and links each node back to the correct GPU addresses.
-4. The integration starts graph restoration in the background before model weights start downloading. Weight download takes ~66 seconds. Graph restoration takes <1 second. By the time vLLM needs the graphs, they're already done.
+1. Foundry's hook activates at the same base address. Every model tensor lands at the same spot as the save run.
+2. Passthrough recording captures the new non-Foundry addresses. A size-based matcher builds an old-to-new address map.
+3. Memory profiling runs with the Foundry allocator temporarily disabled (for runtime side effects), but returns the saved KV cache memory value.
+4. Each graph JSON is patched: kernel parameters containing old non-Foundry addresses get remapped to new ones. Any remaining unmapped addresses get physical memory pre-mapped via raw CUDA VMM calls.
+5. CUDA graphs load from disk one at a time via `fdry.CUDAGraph.load()`, then get directly populated into vLLM's graph wrapper entries — skipping the entire capture loop.
 
-See OPTIMIZATIONS.md for a detailed walkthrough of every optimization, including failed attempts.
+See FOUNDRY_INTEGRATION.md for the full architecture and OPTIMIZATIONS.md for a detailed walkthrough of every optimization, including failed attempts.
 
 ## Usage
 
@@ -94,7 +102,9 @@ llm = cached_vllm_init_with_foundry(
 )
 ```
 
-For `tensor_parallel_size > 1`, Foundry setup is deferred to each worker subprocess. Each GPU gets its own allocation region and per-rank graph cache. Requires fork-based multiprocessing (Linux default for vLLM).
+For `tensor_parallel_size > 1`, Foundry setup is deferred to each worker subprocess via a patched `Worker.init_device`. Each GPU gets its own allocation region and per-rank graph cache (`rank_0/`, `rank_1/`, etc.). All ranks agree on save vs. load mode before any NCCL collective fires. Requires fork-based multiprocessing (Linux default for vLLM).
+
+In multi-GPU mode, `disable_custom_all_reduce=True` is set to force the standard NCCL path, and an NCCL warmup allreduce runs during passthrough recording to capture NCCL's internal allocations.
 
 ## Requirements
 
@@ -106,14 +116,17 @@ For `tensor_parallel_size > 1`, Foundry setup is deferred to each worker subproc
 
 ```
 src/vllm_profile_cache/
-    foundry_graphs.py    # All monkey-patches and main entry point
+    foundry_graphs.py    # All monkey-patches, address patching, and main entry point (1608 lines)
     cache.py             # Profile cache key computation and read/write
     wrapper.py           # CLI wrapper for vllm serve
     modal_plugin.py      # Modal integration with Volume-backed cache
 
 profiling/
     modal_foundry_benchmark.py             # A/B benchmark on Modal A100s (single GPU)
-    modal_foundry_multi_gpu_benchmark.py   # A/B benchmark on Modal A100s (multi-GPU)
+    modal_foundry_multi_gpu_benchmark.py   # A/B benchmark on Modal A100s (multi-GPU, tp=2)
+    modal_foundry_matrix.py                # Parameter sweep benchmarks
+    modal_foundry_introspect.py            # Debug introspection for Foundry internals
+    modal_cache_benchmark.py               # A/B benchmark for profile caching (no Foundry)
 ```
 
 ## Benchmarking
