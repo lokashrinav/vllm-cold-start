@@ -1027,6 +1027,23 @@ Init engine: 1.79s (measured)
 Total: ~110s (measured, Qwen2.5-7B on A100-40GB)
 ```
 
+### Multi-GPU Benchmark Results (tp=2, same-container comparison)
+
+Baseline and Foundry load measured on the **same Modal container** to eliminate
+volume I/O variance (v31 benchmark):
+
+| Metric | Baseline | Foundry Load | Savings |
+|--------|----------|--------------|---------|
+| LLM init | 206.49s | 55.25s | **151.24s (73.2%)** |
+| Total | 216.14s | 62.01s | **154.13s (71.3%)** |
+| CUDA graphs | 0 (captured fresh) | 35/35 per rank | — |
+
+Load run breakdown:
+- Weight loading: 15.10s (rank 0), 14.70s (rank 1)
+- Graph loading: 1.58s (rank 0), 1.52s (rank 1) — 35/35 graphs each
+- `compile_or_warm_up_model`: 8.39s
+- Passthrough matching: 27 matched, 27 remapped per rank
+
 ### What each optimization saves
 
 | Optimization | Saves | Mechanism |

@@ -10,7 +10,7 @@ os.chdir(r"C:\Users\lokas\vllm-cold-start")
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
-log_path = r"C:\Users\lokas\vllm-cold-start\benchmark_v24.log"
+log_path = r"C:\Users\lokas\vllm-cold-start\benchmark_v31.log"
 
 proc = subprocess.Popen(
     [r"C:\Users\lokas\AppData\Local\Microsoft\WindowsApps\python3.exe",

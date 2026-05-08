@@ -1767,7 +1767,33 @@ was used. Retained for context on the optimization progression.)*
 
 ## 21. Final results
 
-Benchmarked on A100-SXM4-40GB, Qwen/Qwen2.5-7B-Instruct, Modal:
+Benchmarked on A100-SXM4-40GB, Qwen/Qwen2.5-7B-Instruct, Modal.
+
+### Multi-GPU (tp=2, same-container comparison)
+
+Baseline and cached runs executed on the **same container** to eliminate Modal
+volume I/O variance. This is the authoritative benchmark.
+
+| Metric | Baseline | Cached (Foundry load) | Savings |
+|--------|----------|-----------------------|---------|
+| LLM init | 206.49 s | 55.25 s | **151.24 s (73.2%)** |
+| Total (init + first inference) | 216.14 s | 62.01 s | **154.13 s (71.3%)** |
+| CUDA graphs loaded | 0 (captured fresh) | 35/35 per rank | — |
+| Weight loading (`_orig_load_weights`) | — | 15.10 s (rank 0) | — |
+| Graph loading (35 graphs) | — | 1.58 s | — |
+| `compile_or_warm_up_model` | — | 8.39 s | — |
+
+**Breakdown of the 62s cached run:**
+
+| Component | Time | Notes |
+|-----------|------|-------|
+| Framework overhead (imports, spawning, model skeleton) | ~31 s | CPU-bound |
+| Weight loading (HF safetensors from volume) | ~15 s | I/O-bound (Modal volume) |
+| `compile_or_warm_up_model` | ~8.4 s | Includes NCCL warmup, graph loading |
+| Graph loading (35 graphs per rank) | ~1.5 s | Address patching + `fdry.CUDAGraph.load()` |
+| First inference | ~6.8 s | Includes deferred Triton JIT |
+
+### Single-GPU
 
 | Metric | Baseline (no Foundry) | Cached (current architecture) |
 |--------|-----------------------|-------------------------------|
@@ -1775,7 +1801,7 @@ Benchmarked on A100-SXM4-40GB, Qwen/Qwen2.5-7B-Instruct, Modal:
 | `compile_or_warm_up_model` | ~10 s | Skips warmup + Triton JIT (Patches 1b2, 1b3) |
 | `determine_available_memory` | ~16 s | Runs with Foundry disabled, returns saved value |
 | Graph loading | N/A (captured fresh) | Per-graph `fdry.CUDAGraph.load()` + direct-populate |
-| Total `LLM()` init | 137 s | **~114 s** (17% faster) |
+| Total `LLM()` init | ~137 s | **~114 s** (17% faster) |
 | First inference | 1.14 s | 2.58 s (+1.44 s kernel JIT from deferred Triton compilation) |
 
 ### Historical progression
@@ -1790,7 +1816,19 @@ Benchmarked on A100-SXM4-40GB, Qwen/Qwen2.5-7B-Instruct, Modal:
 | + compile_or_warm_up fast path (Opt 2) | 0.63 s | 0.32 s | 313 ms |
 | + Early graph builds / Patch 3 (Opt 3) | **0.01 s** | **0.00 s** | **0.6 ms** |
 
-### What the remaining 114s consists of
+### What the remaining time consists of
+
+**Multi-GPU (62s cached):**
+
+| Component | Time | Optimizable? |
+|-----------|------|--------------|
+| Framework overhead (imports, process spawning) | ~31 s | Partially (lazy imports, spawn optimization) |
+| Weight loading (HF safetensors from Modal volume) | ~15 s | Partially (pre-copy to /dev/shm) |
+| `compile_or_warm_up_model` | ~8.4 s | Partially (NCCL warmup, profiling side effects) |
+| Graph loading (35 graphs per rank) | ~1.5 s | Fully optimized |
+| First inference (deferred Triton JIT) | ~6.8 s | Tradeoff (saves 15s from init) |
+
+**Single-GPU (114s cached):**
 
 | Component | Time | Optimizable? |
 |-----------|------|--------------|
@@ -1800,9 +1838,9 @@ Benchmarked on A100-SXM4-40GB, Qwen/Qwen2.5-7B-Instruct, Modal:
 | init_device + request_memory | ~2 s | No (CUDA context creation) |
 | Other vLLM setup (config, tokenizer, scheduler) | ~23 s | Not in scope |
 
-The serialization path (graph capture → graph load) is fully optimized at
-0.01 s. The remaining 114 s is vLLM's own model loading pipeline, which is
-outside the scope of the CUDA graph serialization integration.
+The graph serialization path is fully optimized at ~1.5 s for 35 graphs.
+The remaining time is dominated by vLLM's model loading pipeline and
+framework overhead.
 
 ---
 

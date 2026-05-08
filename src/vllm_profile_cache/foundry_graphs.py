@@ -21,14 +21,21 @@ Requirements:
   - Foundry installed (pip install -e foundry/)
   - LD_PRELOAD=libcuda_hook.so set before Python starts
   - Linux + NVIDIA GPU (CUDA 12+)
-  - tp_size=1 (single GPU — in-process engine core)
 
 Usage:
     from vllm_profile_cache.foundry_graphs import cached_vllm_init_with_foundry
 
+    # Single GPU
     llm = cached_vllm_init_with_foundry(
-        model="Qwen/Qwen2.5-0.5B-Instruct",
+        model="Qwen/Qwen2.5-7B-Instruct",
         graph_cache_dir="/root/.cache/foundry-graphs",
+    )
+
+    # Multi-GPU (tensor parallelism)
+    llm = cached_vllm_init_with_foundry(
+        model="Qwen/Qwen2.5-7B-Instruct",
+        graph_cache_dir="/root/.cache/foundry-graphs",
+        tensor_parallel_size=2,
     )
 """
 
@@ -915,12 +922,11 @@ def patch_vllm_for_foundry(
     """Monkey-patch vLLM's CUDA graph capture to use Foundry.
 
     Must be called BEFORE creating any vLLM LLM/Engine instances.
-    Only works with tp_size=1 (in-process engine core, no subprocess).
+    Works for both single-GPU (tp=1) and multi-GPU (tp>1, called per-rank).
 
-    In vLLM V1 (0.20+), main model CUDA graphs are captured via
-    CUDAGraphWrapper.__call__() triggered from capture_model(), NOT via
-    CudaGraphManager.capture(). We patch CUDAGraphWrapper.__call__() to
-    intercept FULL mode captures and use Foundry's CUDAGraph instead.
+    Patches CUDAGraphWrapper.__call__() to intercept FULL mode captures,
+    GPUModelRunner.capture_model for orchestration, and
+    GPUWorker.determine_available_memory for profiling optimization.
 
     A phase flag (set via patching GPUModelRunner.capture_model) ensures
     we only intercept during the real capture phase, not during the earlier
@@ -1491,30 +1497,27 @@ def patch_vllm_for_foundry(
     # Graph loading happens lazily in state.load_all() during capture_model()
     # when the model and KV cache are already allocated at deterministic addresses.
 
-    # --- Patch 3: Start graph builds before weight loading ---
-    # Model architecture is created (tensors at deterministic addresses) before
-    # load_weights is called. Weight loading takes ~25s (download + copy),
-    # which is more than enough to overlap Phase 2a template building (~0.6-0.9s).
+    # --- Patch 3: Instrument load_weights timing ---
     if _is_load_mode:
         from vllm.model_executor.model_loader.base_loader import BaseModelLoader
         _original_base_load_weights = BaseModelLoader.load_model
 
-        def _load_model_with_early_builds(self_loader, **kwargs):
-            import threading as _th
-
+        def _load_model_with_timing(self_loader, **kwargs):
             _orig_load_weights = self_loader.load_weights
 
             def _hooked_load_weights(model, model_config):
-                # DEBUG: skip preallocation + early graph builds to isolate crash
-                print("[FOUNDRY] Calling _orig_load_weights (no prealloc/early builds)...", flush=True)
+                import time as _time
+                print("[FOUNDRY] Calling _orig_load_weights...", flush=True)
+                _t0 = _time.monotonic()
                 result = _orig_load_weights(model, model_config)
-                print("[FOUNDRY] _orig_load_weights completed", flush=True)
+                _elapsed = _time.monotonic() - _t0
+                print(f"[FOUNDRY] _orig_load_weights completed in {_elapsed:.2f}s", flush=True)
                 return result
 
             self_loader.load_weights = _hooked_load_weights
             return _original_base_load_weights(self_loader, **kwargs)
 
-        BaseModelLoader.load_model = _load_model_with_early_builds
+        BaseModelLoader.load_model = _load_model_with_timing
 
     logger.info(
         "Patched vLLM for Foundry graph persistence "

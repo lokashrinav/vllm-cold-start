@@ -377,6 +377,179 @@ def clear_cache():
     return {"cleared": True}
 
 
+@app.function(
+    gpu=f"A100-40GB:{TP_SIZE}",
+    image=image,
+    timeout=900,
+    scaledown_window=5,
+    volumes={GRAPH_CACHE_MOUNT: graph_cache_vol},
+)
+def run_same_container_comparison():
+    """Run baseline and Foundry load on the SAME container for valid comparison."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    sys.path.insert(0, "/root")
+
+    # --- Phase 1: Baseline (no Foundry, no LD_PRELOAD) ---
+    print("[COMPARISON] Phase 1: Running baseline (no Foundry)...", flush=True)
+    baseline_script = f"""
+import sys, json, time
+sys.path.insert(0, "/root")
+
+results = {{"mode": "baseline_tp{TP_SIZE}"}}
+t_total = time.perf_counter()
+
+import vllm
+results["vllm_version"] = vllm.__version__
+
+t0 = time.perf_counter()
+from vllm import LLM, SamplingParams
+from vllm.config import CompilationConfig
+from vllm.config.compilation import CUDAGraphMode
+cc = CompilationConfig()
+if hasattr(cc, 'level'):
+    cc.level = 0
+if hasattr(cc, 'mode'):
+    cc.mode = 0
+cc.cudagraph_mode = CUDAGraphMode.FULL
+llm = LLM(
+    model="{MODEL}",
+    tensor_parallel_size={TP_SIZE},
+    gpu_memory_utilization=0.8,
+    disable_log_stats=True,
+    compilation_config=cc,
+)
+results["llm_init"] = time.perf_counter() - t0
+
+t0 = time.perf_counter()
+output = llm.generate(["{PROMPT}"], SamplingParams(max_tokens=16))
+results["first_inference"] = time.perf_counter() - t0
+results["output"] = output[0].outputs[0].text
+results["total"] = time.perf_counter() - t_total
+
+import torch
+results["gpu"] = torch.cuda.get_device_name(0)
+results["gpu_count"] = torch.cuda.device_count()
+
+print("BASELINE_RESULT:" + json.dumps(results))
+"""
+    baseline_result = subprocess.run(
+        [sys.executable, "-c", baseline_script],
+        capture_output=True, text=True, timeout=600,
+    )
+    baseline_data = None
+    for line in (baseline_result.stdout or "").splitlines():
+        if line.startswith("BASELINE_RESULT:"):
+            baseline_data = json.loads(line[len("BASELINE_RESULT:"):])
+    if baseline_data is None:
+        print(f"  [baseline stderr tail] {(baseline_result.stderr or '')[-1000:]}")
+        raise RuntimeError(f"Baseline failed (exit={baseline_result.returncode})")
+    print(f"[COMPARISON] Baseline done: {baseline_data['llm_init']:.2f}s init, {baseline_data['total']:.2f}s total", flush=True)
+
+    # --- Phase 2: Foundry load (with LD_PRELOAD, cached graphs) ---
+    print("[COMPARISON] Phase 2: Running Foundry load...", flush=True)
+    hook_path = _get_hook_path()
+    env = dict(os.environ)
+    env["LD_PRELOAD"] = hook_path
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
+    env["NCCL_DEBUG"] = "INFO"
+    env["NCCL_DEBUG_FILE"] = "/tmp/nccl_debug_%p.log"
+    env["NCCL_P2P_DISABLE"] = "1"
+    env["NCCL_CUMEM_ENABLE"] = "0"
+
+    load_script = f"""
+import sys, json, time, os
+sys.path.insert(0, "/root")
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
+
+results = {{"mode": "foundry_load_tp{TP_SIZE}"}}
+t_total = time.perf_counter()
+
+import vllm
+results["vllm_version"] = vllm.__version__
+
+t0 = time.perf_counter()
+from vllm.config import CompilationConfig
+from vllm.config.compilation import CUDAGraphMode
+from vllm_profile_cache.foundry_graphs import cached_vllm_init_with_foundry
+
+cc = CompilationConfig()
+if hasattr(cc, 'level'):
+    cc.level = 0
+if hasattr(cc, 'mode'):
+    cc.mode = 0
+cc.cudagraph_mode = CUDAGraphMode.FULL
+
+llm = cached_vllm_init_with_foundry(
+    model="{MODEL}",
+    graph_cache_dir="{GRAPH_CACHE_MOUNT}",
+    tensor_parallel_size={TP_SIZE},
+    gpu_memory_utilization=0.8,
+    disable_log_stats=True,
+    compilation_config=cc,
+)
+results["llm_init"] = time.perf_counter() - t0
+
+from vllm import SamplingParams
+t0 = time.perf_counter()
+output = llm.generate(["{PROMPT}"], SamplingParams(max_tokens=16))
+results["first_inference"] = time.perf_counter() - t0
+results["output"] = output[0].outputs[0].text
+results["total"] = time.perf_counter() - t_total
+
+import torch
+results["gpu"] = torch.cuda.get_device_name(0)
+results["gpu_count"] = torch.cuda.device_count()
+
+from vllm_profile_cache.foundry_graphs import resolve_graph_cache_dir, FoundryGraphCache
+from pathlib import Path
+_, cache_key = resolve_graph_cache_dir(
+    "{GRAPH_CACHE_MOUNT}", "{MODEL}",
+    tensor_parallel_size={TP_SIZE},
+    gpu_memory_utilization=0.8,
+    disable_log_stats=True,
+)
+base_dir = Path("{GRAPH_CACHE_MOUNT}") / cache_key
+rank_info = {{}}
+for r in range({TP_SIZE}):
+    rank_dir = base_dir / f"rank_{{r}}"
+    rc = FoundryGraphCache(str(rank_dir))
+    wg_dir = rank_dir / "wrapper_graphs"
+    n_graphs = len(list(wg_dir.glob("graph_*.json"))) if wg_dir.exists() else 0
+    rank_info[f"rank_{{r}}"] = {{
+        "save_complete": rc.is_save_complete(),
+        "graph_count": n_graphs,
+        "has_metadata": rc.load_metadata() is not None,
+    }}
+results["rank_caches"] = rank_info
+results["cache_key"] = cache_key
+
+print("FOUNDRY_RESULT:" + json.dumps(results))
+"""
+    load_result = subprocess.run(
+        [sys.executable, "-c", load_script],
+        env=env, capture_output=True, text=True, timeout=600,
+    )
+    load_data = None
+    if load_result.stdout:
+        for line in load_result.stdout.splitlines():
+            if "[FOUNDRY]" in line:
+                print(f"  {line}")
+        for line in load_result.stdout.splitlines():
+            if line.startswith("FOUNDRY_RESULT:"):
+                load_data = json.loads(line[len("FOUNDRY_RESULT:"):])
+    if load_data is None:
+        print(f"  [load stderr tail] {(load_result.stderr or '')[-2000:]}")
+        raise RuntimeError(f"Foundry load failed (exit={load_result.returncode})")
+    print(f"[COMPARISON] Foundry load done: {load_data['llm_init']:.2f}s init, {load_data['total']:.2f}s total", flush=True)
+
+    return {"baseline": baseline_data, "load": load_data}
+
+
 @app.local_entrypoint()
 def main():
     import json
@@ -387,36 +560,37 @@ def main():
     print("=" * 60)
     print()
 
-    # Skip separate clear_cache — force_clear=True on save run handles it.
-    # (Avoids extra Modal function call during outages.)
-
-    # Skip baseline — already have data (~137s init, ~142s total from prior runs)
-    r1 = {"llm_init": 137.0, "total": 142.4}
-
+    # --- Step 1: Save run (captures graphs) ---
     print("=" * 60)
-    print(f"Run 2: FOUNDRY save (tp={TP_SIZE}, first run)")
+    print(f"Step 1: FOUNDRY save (tp={TP_SIZE}, first run)")
     print("=" * 60)
-    r2 = run_with_foundry_subprocess.remote(force_clear=True)
-    print(f"  LLM init:        {r2['llm_init']:.2f}s")
-    print(f"  First inference:  {r2['first_inference']:.2f}s")
-    print(f"  Total:           {r2['total']:.2f}s")
-    print(f"  Rank caches:     {json.dumps(r2.get('rank_caches', {}), indent=4)}")
+    r_save = run_with_foundry_subprocess.remote(force_clear=True)
+    print(f"  LLM init:        {r_save['llm_init']:.2f}s")
+    print(f"  First inference:  {r_save['first_inference']:.2f}s")
+    print(f"  Total:           {r_save['total']:.2f}s")
+    print(f"  Rank caches:     {json.dumps(r_save.get('rank_caches', {}), indent=4)}")
     print()
 
-    # --- Load (cached graphs from fresh save) ---
+    # --- Step 2: Baseline + Load on SAME container ---
     print("=" * 60)
-    print(f"Run 3: FOUNDRY load (tp={TP_SIZE}, per-rank cache hit)")
+    print(f"Step 2: SAME-CONTAINER comparison (baseline vs load)")
     print("=" * 60)
-    r3 = run_with_foundry_subprocess.remote()
-    print(f"  LLM init:        {r3['llm_init']:.2f}s")
-    print(f"  First inference:  {r3['first_inference']:.2f}s")
-    print(f"  Total:           {r3['total']:.2f}s")
-    print(f"  Rank caches:     {json.dumps(r3.get('rank_caches', {}), indent=4)}")
+    comparison = run_same_container_comparison.remote()
+    r_baseline = comparison["baseline"]
+    r_load = comparison["load"]
+
+    print(f"  Baseline init:   {r_baseline['llm_init']:.2f}s")
+    print(f"  Baseline total:  {r_baseline['total']:.2f}s")
+    print(f"  Load init:       {r_load['llm_init']:.2f}s")
+    print(f"  Load total:      {r_load['total']:.2f}s")
+    print(f"  Rank caches:     {json.dumps(r_load.get('rank_caches', {}), indent=4)}")
     print()
 
-    print("\n=== COMPARISON ===")
-    print(f"  Baseline: {r1['llm_init']:.2f}s init, {r1['total']:.2f}s total")
-    print(f"  Save:     {r2['llm_init']:.2f}s init, {r2['total']:.2f}s total")
-    print(f"  Load:     {r3['llm_init']:.2f}s init, {r3['total']:.2f}s total")
-    delta = r1['total'] - r3['total']
-    print(f"  Savings:  {delta:.2f}s ({delta/r1['total']*100:.1f}%)")
+    print("\n=== COMPARISON (same container) ===")
+    print(f"  Baseline: {r_baseline['llm_init']:.2f}s init, {r_baseline['total']:.2f}s total")
+    print(f"  Save:     {r_save['llm_init']:.2f}s init, {r_save['total']:.2f}s total")
+    print(f"  Load:     {r_load['llm_init']:.2f}s init, {r_load['total']:.2f}s total")
+    init_delta = r_baseline['llm_init'] - r_load['llm_init']
+    total_delta = r_baseline['total'] - r_load['total']
+    print(f"  Init savings:  {init_delta:.2f}s ({init_delta/r_baseline['llm_init']*100:.1f}%)")
+    print(f"  Total savings: {total_delta:.2f}s ({total_delta/r_baseline['total']*100:.1f}%)")

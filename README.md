@@ -32,13 +32,23 @@ The integration solves this with a passthrough recording system. During the save
 
 Tested on A100-SXM4-40GB with Qwen/Qwen2.5-7B-Instruct on Modal.
 
+### Multi-GPU (tp=2, same-container comparison)
+
+Baseline and cached runs on the **same container** to eliminate Modal volume I/O variance:
+
+| Metric | Baseline | Cached | Savings |
+|---|---|---|---|
+| LLM init | 206.49s | 55.25s | 151.24s (73.2%) |
+| Total (init + first inference) | 216.14s | 62.01s | 154.13s (71.3%) |
+| CUDA graphs loaded | 0 (captured fresh) | 35/35 per rank | — |
+
+### Single-GPU
+
 | Metric | Baseline | Cached |
 |---|---|---|
 | GPU initialization | ~30s | <1s |
-| Total cold start | 137s | 114s |
+| Total cold start | ~137s | ~114s |
 | First inference | 1.14s | 2.58s |
-
-The 23s improvement comes from eliminating GPU initialization overhead. The remaining 114s is model weight downloading and loading.
 
 First inference is ~1.4s slower because kernel compilation is deferred. Only the kernels needed for the first request compile, instead of all possible variants compiling upfront.
 
