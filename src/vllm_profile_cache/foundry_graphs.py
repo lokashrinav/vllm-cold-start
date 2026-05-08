@@ -50,13 +50,17 @@ MODEL_REGION_BASE = 0x10000000000  # 64GB — safe for A100 GPU VA space
 DEFAULT_REGION_SIZE = "36GB"
 GRAPH_REGION_BASE = 0x30000000000  # 192GB — separate region for graph-private memory
 GRAPH_REGION_SIZE = "4GB"
-# Fallback addresses when the primary one fails. Must be within GPU VA
-# range (A100 supports ~128TB but lower addresses are more reliable).
-# Keep addresses below ~1TB to avoid driver rejections.
+# Candidate base addresses for the Foundry allocation region.
+# cuMemAddressReserve can fail if the requested VA range is already
+# occupied (CUDA runtime, PyTorch caching allocator, etc). The code
+# iterates until a test allocation lands in the region.
+# The default Foundry region at 0x500000000000 is reserved by the
+# cuCtxCreate hook; avoid overlap with that 2GB range.
 CANDIDATE_REGION_BASES = [
     MODEL_REGION_BASE,         # 0x10000000000 (64GB)
     0x8000000000,              # 32GB
     0x18000000000,             # 96GB
+    0x30000000000,             # 192GB
     0x4000000000,              # 16GB
     0x20000000000,             # 128GB
 ]
@@ -245,6 +249,8 @@ class _FoundryPatchState:
     _preparse_pending: Optional[Any] = field(default=None, repr=False)
     _preparse_iter: Optional[Any] = field(default=None, repr=False)
     _preloaded_graphs: Optional[list] = field(default=None, repr=False)
+    passthrough_events: Optional[list] = field(default=None, repr=False)
+    _extended_recording: bool = False
 
     @property
     def wrapper_graphs_dir(self) -> Path:
@@ -277,7 +283,6 @@ class _FoundryPatchState:
             self.load_index += 1
             return (graph, output)
         return None
-        return (graph, output)
 
     def save_graph(self, desc: Any, graph: Any, output: Any = None) -> None:
         self.wrapper_graphs_dir.mkdir(parents=True, exist_ok=True)
@@ -311,6 +316,7 @@ class _FoundryPatchState:
             backend="vllm.compilation.cuda_graph.CUDAGraphWrapper",
             available_kv_cache_memory=self.available_kv_cache_memory,
             determine_cursor_delta=self.determine_cursor_delta,
+            passthrough_events=self.passthrough_events,
         )
         self.cache.write_save_complete_marker()
 
@@ -331,6 +337,7 @@ class _FoundryPatchState:
             backend="vllm.compilation.cuda_graph.CUDAGraphWrapper",
             available_kv_cache_memory=self.available_kv_cache_memory,
             determine_cursor_delta=self.determine_cursor_delta,
+            passthrough_events=self.passthrough_events,
         )
         logger.info(
             "Saved %d wrapper CUDA graphs in %.2fs",
@@ -382,15 +389,17 @@ def setup_foundry_regions(
     candidates failed.  When *force_base* is given (load path), only that
     address is tried.  Otherwise every address in CANDIDATE_REGION_BASES is
     attempted in order.
+
+    NOTE: set_allocation_region() can fail silently (cuMemAddressReserve
+    returns a different address than requested). The C++ code disables the
+    region but does NOT throw a Python exception. We verify with a test
+    allocation after each attempt.
     """
     import torch
     import foundry as fdry
 
-    # Disable PyTorch expandable_segments which uses cuMemAddressReserve
-    # and can conflict with Foundry's deterministic VMM
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:False")
 
-    # Foundry requires CUDA context before set_allocation_region
     if not torch.cuda.is_initialized():
         torch.cuda.init()
 
@@ -401,42 +410,494 @@ def setup_foundry_regions(
     for base in bases_to_try:
         try:
             fdry.set_allocation_region(base, size_bytes)
-            used_base = base
-            logger.info("Foundry allocation region: base=0x%x, size=%s", base, region_size)
-            break
         except Exception as e:
-            logger.warning("set_allocation_region(0x%x) failed: %s", base, e)
+            print(f"[FOUNDRY] set_allocation_region(0x{base:x}) exception: {e}", flush=True)
+            continue
 
-    if used_base is not None:
-        # Verify the region actually works by checking a test allocation
+        # Flush cached blocks from the default region (0x500000000000)
+        # so the test allocation goes through cuMemAlloc_v2.
+        torch.cuda.empty_cache()
+
+        # Verify: allocate and check address. Keep tensor alive —
+        # cuMemFree_v2 calls cuMemAddressFree on sub-ranges of the
+        # reservation which is undefined behavior per CUDA docs.
         test = torch.empty(1024, device="cuda")
         ptr = test.data_ptr()
-        in_region = used_base <= ptr < (used_base + size_bytes)
-        if in_region:
-            logger.info("Region verified: test tensor at 0x%x (within region)", ptr)
-        else:
-            logger.warning(
-                "Region NOT verified: test tensor at 0x%x (outside 0x%x-0x%x). "
-                "Deterministic addressing may not be working.",
-                ptr, used_base, used_base + size_bytes,
-            )
+        cursor = fdry.get_current_alloc_offset()
+        if base <= ptr < (base + size_bytes) and cursor > 0:
+            used_base = base
             print(
-                f"[FOUNDRY_DEBUG] VERIFICATION FAILED: tensor at 0x{ptr:x}, "
-                f"expected in [0x{used_base:x}, 0x{used_base + size_bytes:x})",
+                f"[FOUNDRY] Region OK at 0x{base:x}: "
+                f"test=0x{ptr:x}, cursor={cursor}",
                 flush=True,
             )
+            break
+
+        # Region failed silently — try next candidate
+        print(
+            f"[FOUNDRY] Region 0x{base:x} failed: "
+            f"test=0x{ptr:x}, cursor={cursor}. Trying next.",
+            flush=True,
+        )
         del test
-        torch.cuda.empty_cache()
 
     if used_base is None:
         logger.error(
             "All allocation region candidates failed. "
-            "GPU addresses will be non-deterministic; graph save/load will not work."
+            "GPU addresses will be non-deterministic."
         )
 
     fdry.set_pack_fatbins_on_exit(False)
     _install_sigabrt_handler()
     return used_base
+
+
+def _premap_non_foundry_addresses(
+    graph_paths: list,
+    device_index: int,
+    region_base: Optional[int] = None,
+    region_size: str = DEFAULT_REGION_SIZE,
+):
+    """Pre-map physical memory at non-Foundry addresses referenced by saved graphs.
+
+    NCCL workspace and other non-Foundry allocations get baked into CUDA graph
+    kernel arguments during capture. On reload, those addresses must have
+    physical backing or the GPU faults (XID 31). This function scans all
+    kernel parameter hex values for pointer-sized integers outside the Foundry
+    region, then reserves VA + physical memory at those locations.
+    """
+    import json as _json
+    import struct
+    import ctypes
+
+    base = region_base if region_base is not None else MODEL_REGION_BASE
+    region_lo = base
+    region_hi = base + _parse_size_bytes(region_size)
+
+    GRANULARITY = 2 * 1024 * 1024  # 2MB
+    MIN_GPU_ADDR = 0x1_0000_0000       # 4GB — below this is unlikely GPU memory
+    MAX_GPU_ADDR = 0x800_0000_0000_0000  # way above any real GPU allocation
+
+    non_foundry_addrs: set[int] = set()
+
+    def _check_addr(addr: int):
+        if addr == 0:
+            return
+        if addr < MIN_GPU_ADDR or addr >= MAX_GPU_ADDR:
+            return
+        if region_lo <= addr < region_hi:
+            return
+        if addr & 0xFFF:  # not page-aligned → probably not a pointer
+            return
+        non_foundry_addrs.add(addr)
+
+    for path in graph_paths:
+        try:
+            with open(path, "r") as f:
+                g = _json.load(f)
+        except Exception:
+            continue
+        for node in g.get("nodes", []):
+            ntype = node.get("type", "")
+            p = node.get("params", {})
+
+            if ntype == "MemsetNode":
+                _check_addr(p.get("dst", 0))
+            elif ntype == "MemcpyNode":
+                _check_addr(p.get("srcDevice", 0))
+                _check_addr(p.get("dstDevice", 0))
+
+            if ntype == "KernelNode":
+                for kp in p.get("kernelParams", []):
+                    hex_val = kp.get("value_hex", "")
+                    param_size = kp.get("size", 0)
+                    if not hex_val or param_size < 8:
+                        continue
+                    try:
+                        raw = bytes.fromhex(hex_val)
+                    except ValueError:
+                        continue
+                    for off in range(0, len(raw) - 7, 8):
+                        val = struct.unpack_from("<Q", raw, off)[0]
+                        _check_addr(val)
+
+                # Also check the arg_buffer (extra params)
+                hex_val = p.get("arg_buffer_hex", "")
+                if hex_val:
+                    try:
+                        raw = bytes.fromhex(hex_val)
+                    except ValueError:
+                        raw = b""
+                    for off in range(0, len(raw) - 7, 8):
+                        val = struct.unpack_from("<Q", raw, off)[0]
+                        _check_addr(val)
+
+    if not non_foundry_addrs:
+        print(f"[FOUNDRY] No non-Foundry addresses in graphs for device {device_index}", flush=True)
+        return
+
+    sorted_addrs = sorted(non_foundry_addrs)
+    sample = [f"0x{a:x}" for a in sorted_addrs[:5]]
+    print(
+        f"[FOUNDRY] Found {len(non_foundry_addrs)} unique non-Foundry pointer(s) "
+        f"in graphs for device {device_index}, sample: {sample}",
+        flush=True,
+    )
+
+    # Build allocation ranges: round each address down to 2MB, extend by 2MB
+    range_set: dict[int, int] = {}
+    for addr in non_foundry_addrs:
+        a_lo = (addr // GRANULARITY) * GRANULARITY
+        a_hi = a_lo + GRANULARITY
+        prev = range_set.get(a_lo, a_lo)
+        range_set[a_lo] = max(prev, a_hi)
+
+    # Merge overlapping / adjacent ranges
+    sorted_ranges = sorted(range_set.items())
+    merged: list[tuple[int, int]] = []
+    cur_lo, cur_hi = sorted_ranges[0]
+    for lo, hi in sorted_ranges[1:]:
+        if lo <= cur_hi:
+            cur_hi = max(cur_hi, hi)
+        else:
+            merged.append((cur_lo, cur_hi))
+            cur_lo, cur_hi = lo, hi
+    merged.append((cur_lo, cur_hi))
+
+    # Pre-map each range using CUDA VMM APIs via ctypes.
+    # Stop the Foundry region so cuMemAddressReserve passes through to
+    # the real driver (hook checks tls_storage.enabled).
+    import foundry as fdry
+    fdry.stop_allocation_region()
+
+    try:
+        libcuda = ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        print("[FOUNDRY] WARNING: cannot load libcuda.so.1 for pre-mapping", flush=True)
+        fdry.resume_allocation_region()
+        return
+
+    mapped_count = 0
+    mapped_bytes = 0
+    for lo, hi in merged:
+        size = hi - lo
+        reserved_ptr = ctypes.c_uint64(0)
+        ret = libcuda.cuMemAddressReserve(
+            ctypes.byref(reserved_ptr), ctypes.c_size_t(size),
+            ctypes.c_size_t(GRANULARITY), ctypes.c_uint64(lo), ctypes.c_ulonglong(0),
+        )
+        if ret != 0 or reserved_ptr.value != lo:
+            print(
+                f"[FOUNDRY] cuMemAddressReserve failed: lo=0x{lo:x} size={size} "
+                f"ret={ret} got=0x{reserved_ptr.value:x}",
+                flush=True,
+            )
+            if ret == 0:
+                libcuda.cuMemAddressFree(reserved_ptr, ctypes.c_size_t(size))
+            continue
+
+        # Create physical backing
+        alloc_handle = ctypes.c_uint64(0)
+
+        class CUmemAllocationProp(ctypes.Structure):
+            _fields_ = [
+                ("type", ctypes.c_int),           # CU_MEM_ALLOCATION_TYPE_PINNED = 1
+                ("requestedHandleTypes", ctypes.c_int),
+                ("location_type", ctypes.c_int),   # CU_MEM_LOCATION_TYPE_DEVICE = 1
+                ("location_id", ctypes.c_int),
+                ("win32HandleMetaData", ctypes.c_void_p),
+                ("allocFlags_compressionType", ctypes.c_uint8),
+                ("allocFlags_gpuDirectRDMACapable", ctypes.c_uint8),
+                ("allocFlags_usage", ctypes.c_uint16),
+                ("allocFlags_reserved", ctypes.c_uint8 * 4),
+            ]
+
+        prop = CUmemAllocationProp()
+        prop.type = 1  # CU_MEM_ALLOCATION_TYPE_PINNED
+        prop.location_type = 1  # CU_MEM_LOCATION_TYPE_DEVICE
+        prop.location_id = device_index
+
+        ret = libcuda.cuMemCreate(
+            ctypes.byref(alloc_handle), ctypes.c_size_t(size),
+            ctypes.byref(prop), ctypes.c_ulonglong(0),
+        )
+        if ret != 0:
+            libcuda.cuMemAddressFree(ctypes.c_uint64(lo), ctypes.c_size_t(size))
+            continue
+
+        ret = libcuda.cuMemMap(
+            ctypes.c_uint64(lo), ctypes.c_size_t(size),
+            ctypes.c_size_t(0), alloc_handle, ctypes.c_ulonglong(0),
+        )
+        if ret != 0:
+            libcuda.cuMemRelease(alloc_handle)
+            libcuda.cuMemAddressFree(ctypes.c_uint64(lo), ctypes.c_size_t(size))
+            continue
+
+        class CUmemAccessDesc(ctypes.Structure):
+            _fields_ = [
+                ("location_type", ctypes.c_int),
+                ("location_id", ctypes.c_int),
+                ("flags", ctypes.c_int),
+            ]
+
+        desc = CUmemAccessDesc()
+        desc.location_type = 1  # CU_MEM_LOCATION_TYPE_DEVICE
+        desc.location_id = device_index
+        desc.flags = 1  # CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+
+        libcuda.cuMemSetAccess(
+            ctypes.c_uint64(lo), ctypes.c_size_t(size),
+            ctypes.byref(desc), ctypes.c_size_t(1),
+        )
+
+        mapped_count += 1
+        mapped_bytes += size
+
+    fdry.resume_allocation_region()
+
+    print(
+        f"[FOUNDRY] Pre-mapped {mapped_count}/{len(merged)} non-Foundry ranges "
+        f"({mapped_bytes / (1024**2):.1f} MB) for device {device_index}",
+        flush=True,
+    )
+
+
+def _build_passthrough_addr_map(
+    save_events: list[dict],
+    load_events: list[dict],
+) -> list[tuple[int, int, int, int]]:
+    """Build old->new address range mapping from passthrough events.
+
+    Uses size-based greedy matching: for each save event, find the first
+    unmatched load event with the same allocation size.  This handles
+    event count and ordering differences between save/load runs (e.g.
+    different code paths producing different event sequences).
+
+    Returns list of (old_base, old_end, new_base, delta) tuples sorted
+    by old_base for binary-search patching.
+    """
+    from collections import defaultdict
+
+    ranges: list[tuple[int, int, int, int]] = []
+
+    if not save_events or not load_events:
+        return ranges
+
+    load_by_size: dict[int, list[dict]] = defaultdict(list)
+    for ev in load_events:
+        load_by_size[ev["size"]].append(ev)
+
+    n_remapped = 0
+    n_matched = 0
+    n_unmatched = 0
+    for s_ev in save_events:
+        s_ptr, s_size = s_ev["ptr"], s_ev["size"]
+        candidates = load_by_size.get(s_size)
+        if not candidates:
+            n_unmatched += 1
+            continue
+        l_ev = candidates.pop(0)
+        n_matched += 1
+        l_ptr = l_ev["ptr"]
+        if s_ptr != l_ptr:
+            delta = l_ptr - s_ptr
+            ranges.append((s_ptr, s_ptr + s_size, l_ptr, delta))
+            n_remapped += 1
+            if n_remapped <= 10:
+                print(
+                    f"[FOUNDRY] addr remap: 0x{s_ptr:x} -> 0x{l_ptr:x} "
+                    f"(size={s_size}, source={s_ev.get('source', '?')})",
+                    flush=True,
+                )
+
+    if n_remapped > 10:
+        print(f"[FOUNDRY] ... and {n_remapped - 10} more remappings", flush=True)
+
+    print(
+        f"[FOUNDRY] Passthrough matching: {n_matched} matched, "
+        f"{n_remapped} remapped, {n_unmatched} save-only (no load match) "
+        f"(save={len(save_events)} load={len(load_events)})",
+        flush=True,
+    )
+
+    ranges.sort(key=lambda r: r[0])
+    return ranges
+
+
+def _remap_addr(addr: int, ranges: list[tuple[int, int, int, int]]) -> int:
+    """Binary search for addr in sorted ranges, apply delta if found."""
+    lo, hi = 0, len(ranges) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        r_lo, r_hi, _, delta = ranges[mid]
+        if addr < r_lo:
+            hi = mid - 1
+        elif addr >= r_hi:
+            lo = mid + 1
+        else:
+            return addr + delta
+    return addr
+
+
+def _patch_graph_json_addresses(
+    graph_path: str,
+    ranges: list[tuple[int, int, int, int]],
+) -> str:
+    """Patch kernel parameter addresses in a graph JSON file.
+
+    For each 8-byte little-endian value in kernel params that falls inside
+    a remapped range, applies the delta to produce the correct load-time
+    address.  Handles interior pointers (base + offset within a buffer).
+
+    Returns (patched_path, patch_count).
+    """
+    import struct
+
+    with open(graph_path, "r") as f:
+        graph = json.load(f)
+
+    patch_count = 0
+
+    def _patch_hex_field(hex_str: str) -> str:
+        nonlocal patch_count
+        if not hex_str or len(hex_str) < 16:
+            return hex_str
+        raw = bytes.fromhex(hex_str)
+        result = bytearray(raw)
+        changed = False
+        for off in range(0, len(raw) - 7, 8):
+            val = struct.unpack_from("<Q", raw, off)[0]
+            new_val = _remap_addr(val, ranges)
+            if new_val != val:
+                struct.pack_into("<Q", result, off, new_val)
+                changed = True
+                patch_count += 1
+        return result.hex() if changed else hex_str
+
+    def _remap_int_field(val: int) -> int:
+        nonlocal patch_count
+        new_val = _remap_addr(val, ranges)
+        if new_val != val:
+            patch_count += 1
+        return new_val
+
+    for node in graph.get("nodes", []):
+        params = node.get("params", {})
+        if node.get("type") == "KernelNode":
+            for kp in params.get("kernelParams", []):
+                if "value_hex" in kp and kp.get("size", 0) >= 8:
+                    kp["value_hex"] = _patch_hex_field(kp["value_hex"])
+            if "extra_argBuffer_hex" in params:
+                params["extra_argBuffer_hex"] = _patch_hex_field(
+                    params["extra_argBuffer_hex"]
+                )
+        elif node.get("type") == "MemsetNode":
+            if "dst" in params:
+                params["dst"] = _remap_int_field(params["dst"])
+        elif node.get("type") == "MemcpyNode":
+            for key in ("srcDevice", "dstDevice"):
+                if key in params:
+                    params[key] = _remap_int_field(params[key])
+
+    graph_dir = os.path.dirname(graph_path)
+    base_name = os.path.basename(graph_path)
+    patched_path = os.path.join(graph_dir, f".patched_{base_name}")
+    with open(patched_path, "w") as f:
+        json.dump(graph, f)
+
+    return patched_path, patch_count
+
+
+def _diagnose_unpatched_addresses(
+    graph_paths: list[str],
+    addr_ranges: list[tuple[int, int, int, int]],
+    region_base: int,
+    region_size_bytes: int,
+) -> None:
+    """Log non-Foundry addresses that are NOT covered by any passthrough range."""
+    import struct as _struct
+
+    MIN_GPU_ADDR = 0x1_0000_0000
+    MAX_GPU_ADDR = 0x800_0000_0000_0000
+    region_lo = region_base
+    region_hi = region_base + region_size_bytes
+
+    unpatched: dict[int, int] = {}
+
+    for path in graph_paths:
+        try:
+            with open(path, "r") as f:
+                graph = json.load(f)
+        except Exception:
+            continue
+        for node in graph.get("nodes", []):
+            params = node.get("params", {})
+            ntype = node.get("type", "")
+
+            def _check(val: int):
+                if val == 0 or val < MIN_GPU_ADDR or val >= MAX_GPU_ADDR:
+                    return
+                if region_lo <= val < region_hi:
+                    return
+                if _remap_addr(val, addr_ranges) != val:
+                    return
+                unpatched[val] = unpatched.get(val, 0) + 1
+
+            if ntype == "MemsetNode":
+                _check(params.get("dst", 0))
+            elif ntype == "MemcpyNode":
+                _check(params.get("srcDevice", 0))
+                _check(params.get("dstDevice", 0))
+
+            if ntype == "KernelNode":
+                for kp in params.get("kernelParams", []):
+                    hex_val = kp.get("value_hex", "")
+                    if not hex_val or kp.get("size", 0) < 8:
+                        continue
+                    try:
+                        raw = bytes.fromhex(hex_val)
+                    except ValueError:
+                        continue
+                    for off in range(0, len(raw) - 7, 8):
+                        val = _struct.unpack_from("<Q", raw, off)[0]
+                        _check(val)
+                extra = params.get("extra_argBuffer_hex", "")
+                if extra:
+                    try:
+                        raw = bytes.fromhex(extra)
+                    except ValueError:
+                        raw = b""
+                    for off in range(0, len(raw) - 7, 8):
+                        val = _struct.unpack_from("<Q", raw, off)[0]
+                        _check(val)
+
+    if not unpatched:
+        print("[FOUNDRY] Diagnostic: all non-Foundry addresses are covered by passthrough ranges", flush=True)
+        return
+
+    sorted_addrs = sorted(unpatched.items(), key=lambda x: -x[1])
+    print(
+        f"[FOUNDRY] WARNING: {len(unpatched)} unique non-Foundry addresses "
+        f"NOT covered by any passthrough range:",
+        flush=True,
+    )
+    for addr, count in sorted_addrs[:20]:
+        print(f"  0x{addr:x} (referenced {count} times)", flush=True)
+    if len(sorted_addrs) > 20:
+        print(f"  ... and {len(sorted_addrs) - 20} more", flush=True)
+
+
+def _parse_size_bytes(s: str) -> int:
+    """Parse a size string like '36GB' to bytes."""
+    s = s.strip().upper()
+    if s.endswith("GB"):
+        return int(s[:-2]) * (1024 ** 3)
+    if s.endswith("MB"):
+        return int(s[:-2]) * (1024 ** 2)
+    if s.endswith("KB"):
+        return int(s[:-2]) * 1024
+    return int(s)
 
 
 def patch_vllm_for_foundry(
@@ -544,8 +1005,14 @@ def patch_vllm_for_foundry(
         GPUModelRunner.profile_cudagraph_memory = _skip_profile_cudagraph
     else:
         def _instrumented_profile_cudagraph(self):
+            if state._extended_recording:
+                fdry.pause_passthrough_record()
             pre_cursor = fdry.get_current_alloc_offset()
-            result = _original_profile_cudagraph(self)
+            try:
+                result = _original_profile_cudagraph(self)
+            finally:
+                if state._extended_recording:
+                    fdry.resume_passthrough_record()
             post_cursor = fdry.get_current_alloc_offset()
             state.profile_cudagraph_estimate = result
             state.profile_cudagraph_cursor_delta = post_cursor - pre_cursor
@@ -566,54 +1033,27 @@ def patch_vllm_for_foundry(
         _saved_det_delta = determine_cursor_delta
 
         def _skip_determine(self):
-            cur = fdry.get_current_alloc_offset()
-            if not state._preallocated_early:
-                region_end = fdry.parse_size(region_size)
-                remaining = region_end - cur
-                if remaining > 0:
-                    try:
-                        if fdry.preallocate_region(remaining):
-                            print(
-                                f"[FOUNDRY] Early preallocation: "
-                                f"{remaining / 2**30:.2f} GiB (cursor={cur})",
-                                flush=True,
-                            )
-                        state._preallocated_early = True
-                    except Exception as e:
-                        print(f"[FOUNDRY] Early preallocation failed: {e}", flush=True)
-            fdry.set_current_alloc_offset(cur + _saved_det_delta)
-            post = fdry.get_current_alloc_offset()
-            print(
-                f"[FOUNDRY] Skipped determine_available_memory: "
-                f"cursor {cur} -> {post} (delta={_saved_det_delta}), "
-                f"returning saved kv_cache_memory={_saved_kv_mem}",
-                flush=True,
-            )
-
-            if not state._preparse_pending:
-                precopy_thread = getattr(state, '_precopy_thread', None)
-                if precopy_thread is not None:
-                    precopy_thread.join()
-                state.load_all()
-                if state._graph_files:
-                    shm_dir = getattr(state, '_shm_graph_dir', None)
-                    if shm_dir is not None and shm_dir.exists():
-                        all_paths = [
-                            str(shm_dir / p.name)
-                            for p in state._graph_files
-                        ]
-                    else:
-                        all_paths = [str(p) for p in state._graph_files]
-                    state._preparse_pending = fdry.CUDAGraph.start_graph_builds(
-                        all_paths, num_threads=min(len(all_paths), 16),
-                    )
-
+            print("[FOUNDRY] Running original determine_available_memory "
+                  "(for initialization side-effects only)",
+                  flush=True)
+            fdry.stop_allocation_region()
+            try:
+                result = _original_determine(self)
+            finally:
+                fdry.resume_allocation_region()
+            print(f"[FOUNDRY] determine_available_memory returned {result} "
+                  f"(using saved value {_saved_kv_mem} for cursor alignment)",
+                  flush=True)
             return _saved_kv_mem
         GPUWorker.determine_available_memory = _skip_determine
     else:
         def _instrumented_determine(self):
+            fdry.stop_allocation_region()
             pre_cursor = fdry.get_current_alloc_offset()
-            result = _original_determine(self)
+            try:
+                result = _original_determine(self)
+            finally:
+                fdry.resume_allocation_region()
             post_cursor = fdry.get_current_alloc_offset()
             state.available_kv_cache_memory = result
             state.determine_cursor_delta = post_cursor - pre_cursor
@@ -625,6 +1065,16 @@ def patch_vllm_for_foundry(
             return result
         GPUWorker.determine_available_memory = _instrumented_determine
 
+    # --- Debug: log create_kv_caches ---
+    if hasattr(GPUWorker, 'create_kv_caches'):
+        _original_create_kv = GPUWorker.create_kv_caches
+        def _debug_create_kv(self, *args, **kwargs):
+            print(f"[FOUNDRY] create_kv_caches ENTERED (args={args}, kwargs keys={list(kwargs.keys())})", flush=True)
+            result = _original_create_kv(self, *args, **kwargs)
+            print("[FOUNDRY] create_kv_caches DONE", flush=True)
+            return result
+        GPUWorker.create_kv_caches = _debug_create_kv
+
     # --- Patch 1: GPUModelRunner.capture_model to set phase flag ---
     _original_capture_model = GPUModelRunner.capture_model
 
@@ -632,60 +1082,131 @@ def patch_vllm_for_foundry(
         _capture_phase[0] = True
         _pending_graphs.clear()
 
+        # On LOAD: do NCCL warmup BEFORE ending passthrough recording
+        # so NCCL's cudaMalloc allocations are captured as passthrough events.
+        # On SAVE: recording continues through capture_model where NCCL ops
+        # naturally trigger the same allocations during graph capture.
+        if state._extended_recording and _is_load_mode:
+            try:
+                import torch.distributed as _dist
+                if _dist.is_initialized():
+                    import torch as _torch_warmup
+                    _dev = _torch_warmup.cuda.current_device()
+                    _warmup = _torch_warmup.zeros(1024, device=f"cuda:{_dev}")
+                    _dist.all_reduce(_warmup)
+                    _torch_warmup.cuda.synchronize()
+                    del _warmup
+                    print("[FOUNDRY] NCCL warmup allreduce completed (during recording)", flush=True)
+            except Exception as e:
+                print(f"[FOUNDRY] NCCL warmup failed: {e}", flush=True)
+
+        # Stop extended passthrough recording and capture all events
+        if state._extended_recording:
+            fdry.end_passthrough_record()
+            pt_events = fdry.get_passthrough_events()
+            state.passthrough_events = pt_events
+            state._extended_recording = False
+            print(
+                f"[FOUNDRY] Extended recording: captured {len(pt_events)} "
+                f"total passthrough events (init + post-init)",
+                flush=True,
+            )
+            for i, ev in enumerate(pt_events[:10]):
+                print(
+                    f"  [{i}] {ev['source']} ptr=0x{ev['ptr']:x} size={ev['size']}",
+                    flush=True,
+                )
+            if len(pt_events) > 10:
+                print(f"  ... and {len(pt_events) - 10} more", flush=True)
+
         if not _is_load_mode:
             state.pre_capture_offset = fdry.get_current_alloc_offset()
 
-        if not _is_load_mode:
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
         if _is_load_mode:
+            print("[FOUNDRY] capture_model: calling state.load_all()", flush=True)
             state.load_all()
+            print(f"[FOUNDRY] capture_model: load_all done, {len(state._graph_files)} graph files", flush=True)
             if state._graph_files:
-                if not state._preallocated_early:
-                    cur = fdry.get_current_alloc_offset()
-                    region_end = fdry.parse_size(region_size)
-                    remaining = region_end - cur
-                    if remaining > 0:
-                        try:
-                            if fdry.preallocate_region(remaining):
-                                print(
-                                    f"[FOUNDRY] Preallocated {remaining / 2**30:.2f} GiB "
-                                    f"for graph-private memory (cursor={cur})",
-                                    flush=True,
-                                )
-                        except Exception as e:
-                            print(f"[FOUNDRY] preallocate_region error: {e}", flush=True)
+                import torch as _torch_cap
+                dev = _torch_cap.cuda.current_device()
+                print(f"[FOUNDRY] capture_model: loading graphs on CUDA device={dev}", flush=True)
+                _torch_cap.cuda.set_device(dev)
 
-                if not state._preparse_pending:
-                    precopy_thread = getattr(state, '_precopy_thread', None)
-                    if precopy_thread is not None:
-                        precopy_thread.join()
-                    shm_dir = getattr(state, '_shm_graph_dir', None)
-                    if shm_dir is not None and shm_dir.exists():
-                        all_paths = [
-                            str(shm_dir / p.name)
-                            for p in state._graph_files
-                        ]
-                    else:
-                        all_paths = [str(p) for p in state._graph_files]
-                    state._preparse_pending = fdry.CUDAGraph.start_graph_builds(
-                        all_paths, num_threads=min(len(all_paths), 16),
+                all_paths = [str(p) for p in state._graph_files]
+
+                # Build address range map from passthrough events and patch graph JSONs
+                saved_meta = cache.load_metadata()
+                save_pt = (saved_meta or {}).get("passthrough_events") or []
+                load_pt = state.passthrough_events or []
+                addr_ranges = _build_passthrough_addr_map(save_pt, load_pt)
+
+                patched_paths = []
+                if addr_ranges:
+                    print(
+                        f"[FOUNDRY] Patching {len(all_paths)} graph JSONs "
+                        f"with {len(addr_ranges)} address range remappings",
+                        flush=True,
                     )
+                    total_patches = 0
+                    for orig_path in all_paths:
+                        patched_path, n_patches = _patch_graph_json_addresses(
+                            orig_path, addr_ranges
+                        )
+                        patched_paths.append(patched_path)
+                        total_patches += n_patches
+                    print(
+                        f"[FOUNDRY] Patched {total_patches} address references "
+                        f"across {len(all_paths)} graph files",
+                        flush=True,
+                    )
+                    load_paths = patched_paths
+                    _diagnose_unpatched_addresses(
+                        patched_paths,
+                        addr_ranges,
+                        region_base or MODEL_REGION_BASE,
+                        _parse_size_bytes(region_size),
+                    )
+                else:
+                    print("[FOUNDRY] No address remapping needed", flush=True)
+                    load_paths = all_paths
 
-                t_fin = time.perf_counter()
-                all_loaded = list(
-                    fdry.CUDAGraph.finish_graph_loads(state._preparse_pending)
+                # Pre-map physical memory at non-Foundry addresses that
+                # weren't covered by passthrough patching (e.g. cuBLAS
+                # workspaces allocated during determine_available_memory).
+                # These are scratch buffers — zero-init is fine.
+                _premap_non_foundry_addresses(
+                    load_paths,
+                    dev,
+                    region_base=region_base,
+                    region_size=region_size,
                 )
-                t_fgl = time.perf_counter() - t_fin
+
+                t_load = time.perf_counter()
+                all_loaded = []
+                pool = _torch_cap.cuda.graph_pool_handle()
+                for i, path in enumerate(load_paths):
+                    try:
+                        result = fdry.CUDAGraph.load(path, pool)
+                        all_loaded.append(result)
+                    except Exception as e:
+                        print(f"[FOUNDRY] Failed to load graph {i} ({path}): {e}", flush=True)
+                        break
+                t_load = time.perf_counter() - t_load
+                print(f"[FOUNDRY] Loaded {len(all_loaded)}/{len(all_paths)} graphs in {t_load:.3f}s", flush=True)
+
+                # Clean up patched temp files
+                for p in patched_paths:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
 
                 state._preloaded_graphs = all_loaded
                 state._preparse_pending = None
-                state.load_seconds = t_fgl
-                print(
-                    f"[FOUNDRY] Loaded {len(all_loaded)} graphs in {t_fgl:.3f}s",
-                    flush=True,
-                )
+                state.load_seconds = t_load
 
         print(f"[FOUNDRY] capture_model started (load_mode={_is_load_mode})", flush=True)
         import sys
@@ -721,6 +1242,15 @@ def patch_vllm_for_foundry(
                 state.load_index = graph_idx
             result = 0
         else:
+            if _is_load_mode:
+                n_expected = len(state._graph_files) if hasattr(state, '_graph_files') else 0
+                n_loaded = len(state._preloaded_graphs) if state._preloaded_graphs else 0
+                print(f"[FOUNDRY] Loaded {n_loaded}/{n_expected} graphs from cache, "
+                      f"falling back to native capture for remaining", flush=True)
+                if hasattr(GPUModelRunner, '_warmup_and_capture') and hasattr(state, '_orig_warmup_capture'):
+                    GPUModelRunner._warmup_and_capture = state._orig_warmup_capture
+                if hasattr(state, '_orig_dummy_sampler_run'):
+                    GPUModelRunner._dummy_sampler_run = state._orig_dummy_sampler_run
             try:
                 result = _original_capture_model(self)
             finally:
@@ -732,7 +1262,7 @@ def patch_vllm_for_foundry(
             n_loaded = len(state.loaded_graphs)
             print(
                 f"[FOUNDRY] Loaded {n_loaded} wrapper CUDA graphs "
-                f"from cache in {state.load_seconds:.2f}s",
+                f"from cache in {getattr(state, 'load_seconds', 0):.2f}s",
                 flush=True,
             )
             print(f"[FOUNDRY] capture_model finished (loaded graphs from cache)", flush=True)
@@ -747,19 +1277,12 @@ def patch_vllm_for_foundry(
         if _is_load_mode:
             def _timed_compile_warmup(self):
                 import time as _t
-                from vllm.utils.torch_utils import set_random_seed
-                from vllm.v1.worker.worker_base import CompilationTimes
+                print("[FOUNDRY] compile_or_warm_up_model ENTERED", flush=True)
                 t0 = _t.perf_counter()
-                cuda_graph_memory_bytes = 0
-                if not self.model_config.enforce_eager:
-                    cuda_graph_memory_bytes = self.model_runner.capture_model()
-                set_random_seed(self.model_config.seed)
+                result = _original_compile_warmup(self)
                 elapsed = _t.perf_counter() - t0
                 print(f"[FOUNDRY] compile_or_warm_up_model: {elapsed:.2f}s", flush=True)
-                return CompilationTimes(
-                    language_model=self.compilation_config.compilation_time,
-                    encoder=self.compilation_config.encoder_compilation_time,
-                )
+                return result
         else:
             def _timed_compile_warmup(self):
                 import time as _t
@@ -779,6 +1302,7 @@ def patch_vllm_for_foundry(
     # each × 35 batch sizes ≈ 1s) since we return preloaded graphs.
     if _is_load_mode and hasattr(GPUModelRunner, '_warmup_and_capture'):
         _orig_warmup_capture = GPUModelRunner._warmup_and_capture
+        state._orig_warmup_capture = _orig_warmup_capture
 
         def _skip_warmup_capture(self, desc, cudagraph_runtime_mode, **kwargs):
             self._dummy_run(
@@ -800,6 +1324,7 @@ def patch_vllm_for_foundry(
     # kernels compile lazily on first real inference instead.
     if _is_load_mode:
         _original_dummy_sampler_run = GPUModelRunner._dummy_sampler_run
+        state._orig_dummy_sampler_run = _original_dummy_sampler_run
 
         def _skip_dummy_sampler_run(self, *args, **kwargs):
             print("[FOUNDRY_DEBUG] Skipped _dummy_sampler_run (load mode)", flush=True)
@@ -883,12 +1408,9 @@ def patch_vllm_for_foundry(
                         "torch.accelerator.empty_cache", lambda: None
                     )
                 )
-            if self.graph_pool is not None:
-                cuda_graph_mod.set_graph_pool_id(self.graph_pool)
-            else:
-                cuda_graph_mod.set_graph_pool_id(
-                    cuda_graph_mod.current_platform.graph_pool_handle()
-                )
+            # Skip set_graph_pool_id — graph pool uses cudaMallocAsync
+            # which bypasses Foundry's cuMemAlloc_v2 hook, producing
+            # non-deterministic addresses that break graph loading.
 
             cuda_graph_mod.get_offloader().sync_prev_onload()
             with fdry.graph(graph):
@@ -896,6 +1418,10 @@ def patch_vllm_for_foundry(
                 cuda_graph_mod.get_offloader().join_after_forward()
                 if self.cudagraph_options.weak_ref_output:
                     output = cuda_graph_mod.weak_ref_tensors(output)
+
+        # capture_end() inside fdry.graph().__exit__ disables the allocation
+        # region. Re-enable so allocations between captures stay deterministic.
+        fdry.resume_allocation_region()
 
         entry.output = output
         entry.cudagraph = graph
@@ -950,6 +1476,7 @@ def patch_vllm_for_foundry(
             profile_cudagraph_cursor_delta=state.profile_cudagraph_cursor_delta,
             available_kv_cache_memory=state.available_kv_cache_memory,
             determine_cursor_delta=state.determine_cursor_delta,
+            passthrough_events=state.passthrough_events,
         )
         cache.write_save_complete_marker()
         state.finalized = True
@@ -978,46 +1505,11 @@ def patch_vllm_for_foundry(
             _orig_load_weights = self_loader.load_weights
 
             def _hooked_load_weights(model, model_config):
-                if not state._preallocated_early:
-                    cur = fdry.get_current_alloc_offset()
-                    region_end = fdry.parse_size(region_size)
-                    remaining = region_end - cur
-                    if remaining > 0:
-                        try:
-                            if fdry.preallocate_region(remaining):
-                                print(
-                                    f"[FOUNDRY] Early preallocation (pre-weights): "
-                                    f"{remaining / 2**30:.2f} GiB (cursor={cur})",
-                                    flush=True,
-                                )
-                            state._preallocated_early = True
-                        except Exception as e:
-                            print(f"[FOUNDRY] Early preallocation failed: {e}", flush=True)
-
-                if not state._preparse_pending:
-                    precopy_thread = getattr(state, '_precopy_thread', None)
-                    if precopy_thread is not None:
-                        precopy_thread.join()
-                    state.load_all()
-                    if state._graph_files:
-                        shm_dir = getattr(state, '_shm_graph_dir', None)
-                        if shm_dir is not None and shm_dir.exists():
-                            all_paths = [
-                                str(shm_dir / p.name)
-                                for p in state._graph_files
-                            ]
-                        else:
-                            all_paths = [str(p) for p in state._graph_files]
-                        state._preparse_pending = fdry.CUDAGraph.start_graph_builds(
-                            all_paths, num_threads=min(len(all_paths), 16),
-                        )
-                        print(
-                            f"[FOUNDRY] Started early graph builds (pre-weights): "
-                            f"{len(all_paths)} graphs",
-                            flush=True,
-                        )
-
-                return _orig_load_weights(model, model_config)
+                # DEBUG: skip preallocation + early graph builds to isolate crash
+                print("[FOUNDRY] Calling _orig_load_weights (no prealloc/early builds)...", flush=True)
+                result = _orig_load_weights(model, model_config)
+                print("[FOUNDRY] _orig_load_weights completed", flush=True)
+                return result
 
             self_loader.load_weights = _hooked_load_weights
             return _original_base_load_weights(self_loader, **kwargs)
@@ -1049,7 +1541,31 @@ def cached_vllm_init_with_foundry(
 
     Requires Foundry installed and LD_PRELOAD=libcuda_hook.so.
     Falls back to standard vLLM if Foundry is not available.
+
+    For multi-GPU (tensor_parallel_size > 1), Foundry setup is deferred
+    to each worker subprocess via a patched init_device. Requires the
+    fork multiprocessing method (Linux default for vLLM).
     """
+    tp_size = vllm_kwargs.get("tensor_parallel_size", 1)
+
+    if tp_size > 1:
+        # Multi-GPU: check LD_PRELOAD without importing foundry
+        # (importing foundry in parent could init CUDA, forcing spawn)
+        if "libcuda_hook.so" not in os.environ.get("LD_PRELOAD", ""):
+            logger.warning(
+                "LD_PRELOAD not set for multi-GPU Foundry. "
+                "Falling back to standard vLLM."
+            )
+            from vllm import LLM
+            return LLM(model=model, **vllm_kwargs)
+        return _cached_vllm_init_multi_gpu(
+            model=model,
+            graph_cache_dir=graph_cache_dir,
+            region_size=region_size,
+            force_save=force_save,
+            **vllm_kwargs,
+        )
+
     if not is_foundry_available():
         logger.warning(
             "Foundry not available (missing install or LD_PRELOAD not set). "
@@ -1116,6 +1632,14 @@ def cached_vllm_init_with_foundry(
         is_load = has_any and pre_cache.is_save_complete()
     print(f"[FOUNDRY_DEBUG] is_load={is_load}", flush=True)
 
+    if is_load:
+        import foundry as fdry
+        hook_archive = str(Path(effective_cache_dir) / "hook_archive")
+        if os.path.isdir(hook_archive):
+            fdry.set_skip_fatbin_processing(True)
+            fdry.load_cuda_modules_and_libraries(hook_archive)
+            print(f"[FOUNDRY] Loaded CUDA modules from {hook_archive}", flush=True)
+
     # Extract profile data from metadata BEFORE patching so the patch
     # can decide whether to skip profile_cudagraph_memory at install time
     pcg_est = None
@@ -1163,4 +1687,174 @@ def cached_vllm_init_with_foundry(
     init_time = time.perf_counter() - t0
 
     logger.info("vLLM + Foundry init took %.2fs", init_time)
+    return llm
+
+
+def _cached_vllm_init_multi_gpu(
+    model: str,
+    graph_cache_dir: str,
+    region_size: str,
+    force_save: bool,
+    **vllm_kwargs,
+):
+    """Multi-GPU Foundry init: defers setup to each worker subprocess.
+
+    Patches Worker.init_device in the parent process. On Linux (fork),
+    the patch propagates to each worker subprocess. Each worker sets up
+    its own Foundry allocation region and applies rank-specific patches.
+
+    Cache structure:
+        {graph_cache_dir}/{cache_key}/rank_0/
+        {graph_cache_dir}/{cache_key}/rank_1/
+        ...
+    """
+    from vllm.v1.worker.gpu_worker import Worker as GPUWorker
+
+    tp_size = vllm_kwargs.get("tensor_parallel_size", 1)
+
+    # Build cache key without GPU-specific info (safe in parent — no CUDA init).
+    # build_graph_cache_key only reads version strings from torch/vllm.
+    _, cache_key = resolve_graph_cache_dir(
+        graph_cache_dir, model, region_size, **vllm_kwargs
+    )
+    base_dir = Path(graph_cache_dir) / cache_key
+
+    # All ranks must use the same mode to avoid NCCL deadlocks.
+    # Check all rank caches in the parent (filesystem only, no CUDA).
+    if force_save:
+        global_load_mode = False
+        for r in range(tp_size):
+            FoundryGraphCache(str(base_dir / f"rank_{r}")).clear()
+    else:
+        def _rank_cache_ready(r: int) -> bool:
+            rank_dir = base_dir / f"rank_{r}"
+            if not (rank_dir / ".save_complete").exists():
+                return False
+            wg_dir = rank_dir / "wrapper_graphs"
+            return wg_dir.exists() and any(wg_dir.glob("graph_*.json"))
+
+        global_load_mode = all(_rank_cache_ready(r) for r in range(tp_size))
+
+    print(
+        f"[FOUNDRY] Multi-GPU: tp={tp_size}, key={cache_key}, "
+        f"load_mode={global_load_mode}",
+        flush=True,
+    )
+
+    _original_init_device = GPUWorker.init_device
+
+    def _foundry_init_device(self):
+        import torch
+        import foundry as fdry
+
+        rank = self.rank
+        local_rank = self.local_rank
+
+        torch.cuda.set_device(local_rank)
+
+        # Per-rank cache
+        rank_cache_dir = str(base_dir / f"rank_{rank}")
+        rank_cache = FoundryGraphCache(rank_cache_dir)
+        saved_meta = rank_cache.load_metadata() if global_load_mode else None
+        saved_base = saved_meta.get("region_base") if saved_meta else None
+
+        if global_load_mode:
+            hook_archive = str(Path(rank_cache_dir) / "hook_archive")
+            if os.path.isdir(hook_archive):
+                torch.cuda.init()
+                fdry.set_skip_fatbin_processing(True)
+                fdry.load_cuda_modules_and_libraries(hook_archive)
+                print(
+                    f"[FOUNDRY] Rank {rank}: loaded CUDA modules from {hook_archive}",
+                    flush=True,
+                )
+
+        region_base = setup_foundry_regions(
+            region_size=region_size,
+            force_base=saved_base,
+        )
+        if region_base is None and saved_base is not None:
+            rank_cache.clear()
+            region_base = setup_foundry_regions(region_size=region_size)
+
+        if region_base is None:
+            logger.error(
+                "Foundry region setup failed for rank %d, "
+                "falling back to standard init",
+                rank,
+            )
+            _original_init_device(self)
+            return
+
+        pcg_est = saved_meta.get("profile_cudagraph_estimate") if saved_meta else None
+        pcg_delta = saved_meta.get("profile_cudagraph_cursor_delta") if saved_meta else None
+        kv_mem = saved_meta.get("available_kv_cache_memory") if saved_meta else None
+        det_delta = saved_meta.get("determine_cursor_delta") if saved_meta else None
+
+        state = patch_vllm_for_foundry(
+            graph_cache_dir=rank_cache_dir,
+            region_size=region_size,
+            model_id=model,
+            cache_key=cache_key,
+            region_base=region_base,
+            load_mode=global_load_mode,
+            profile_cudagraph_estimate=pcg_est,
+            profile_cudagraph_cursor_delta=pcg_delta,
+            available_kv_cache_memory=kv_mem,
+            determine_cursor_delta=det_delta,
+        )
+
+        if global_load_mode and saved_meta:
+            saved_offset = saved_meta.get("pre_capture_offset")
+            if saved_offset is not None:
+                state.saved_offset_for_load = saved_offset
+            cursor_g0 = saved_meta.get("cursor_after_graph0")
+            if cursor_g0 is not None:
+                state.cursor_after_graph0 = cursor_g0
+            cursor_pos = saved_meta.get("cursor_positions")
+            if cursor_pos is not None:
+                state.cursor_positions = cursor_pos
+
+        atexit.register(state.finalize)
+
+        pre_init_cursor = fdry.get_current_alloc_offset()
+        print(
+            f"[FOUNDRY] Rank {rank} ready: base=0x{region_base:x}, "
+            f"load={global_load_mode}, cursor_before_init={pre_init_cursor}, "
+            f"dir={rank_cache_dir}",
+            flush=True,
+        )
+
+        fdry.stop_allocation_region()
+        fdry.start_passthrough_record()
+        _original_init_device(self)
+        # Keep recording running to capture post-init allocations
+        # (cuBLAS workspaces, etc.) that get baked into CUDA graphs.
+        # Recording will be stopped in _flagged_capture_model.
+        fdry.resume_allocation_region()
+        state._extended_recording = True
+        init_count = len(fdry.get_passthrough_events())
+        print(
+            f"[FOUNDRY] Rank {rank}: {init_count} passthrough events so far "
+            f"(extended recording active through capture_model)",
+            flush=True,
+        )
+
+        post_init_cursor = fdry.get_current_alloc_offset()
+        print(
+            f"[FOUNDRY] Rank {rank} after init_device: "
+            f"cursor={post_init_cursor} ({post_init_cursor/(1024**3):.2f}GB)",
+            flush=True,
+        )
+
+    GPUWorker.init_device = _foundry_init_device
+
+    vllm_kwargs["disable_custom_all_reduce"] = True
+
+    t0 = time.perf_counter()
+    from vllm import LLM
+    llm = LLM(model=model, **vllm_kwargs)
+    init_time = time.perf_counter() - t0
+
+    logger.info("vLLM + Foundry (tp=%d) init took %.2fs", tp_size, init_time)
     return llm

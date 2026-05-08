@@ -84,12 +84,23 @@ llm = cached_vllm_init_with_foundry(
 
 First call captures and saves everything. Subsequent calls restore from cache.
 
+### Multi-GPU (tensor parallelism)
+
+```python
+llm = cached_vllm_init_with_foundry(
+    model="Qwen/Qwen2.5-7B-Instruct",
+    graph_cache_dir="/root/.cache/foundry-graphs",
+    tensor_parallel_size=2,
+)
+```
+
+For `tensor_parallel_size > 1`, Foundry setup is deferred to each worker subprocess. Each GPU gets its own allocation region and per-rank graph cache. Requires fork-based multiprocessing (Linux default for vLLM).
+
 ## Requirements
 
 - Linux + NVIDIA GPU (CUDA 12+)
 - Foundry installed with LD_PRELOAD=libcuda_hook.so
 - vLLM 0.20+
-- tp_size=1 (single GPU)
 
 ## Project structure
 
@@ -101,13 +112,18 @@ src/vllm_profile_cache/
     modal_plugin.py      # Modal integration with Volume-backed cache
 
 profiling/
-    modal_foundry_benchmark.py   # A/B benchmark on Modal A100s
+    modal_foundry_benchmark.py             # A/B benchmark on Modal A100s (single GPU)
+    modal_foundry_multi_gpu_benchmark.py   # A/B benchmark on Modal A100s (multi-GPU)
 ```
 
 ## Benchmarking
 
 ```bash
+# Single GPU
 python -m modal run profiling/modal_foundry_benchmark.py
+
+# Multi-GPU (2x A100)
+python -m modal run profiling/modal_foundry_multi_gpu_benchmark.py
 ```
 
 Runs a baseline (standard vLLM) and a cached run (with Foundry graph persistence) on Modal A100s, then prints a comparison.
