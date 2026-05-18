@@ -119,8 +119,24 @@ In multi-GPU mode, `disable_custom_all_reduce=True` is set to force the standard
 ## Requirements
 
 - Linux + NVIDIA GPU (CUDA 12+)
-- Foundry installed with LD_PRELOAD=libcuda_hook.so
+- [Foundry fork](https://github.com/lokashrinav/foundry) with passthrough recording support (not upstream foundry-org/foundry)
+- `LD_PRELOAD=libcuda_hook.so`
 - vLLM 0.20+
+
+### Foundry installation
+
+This project requires a [fork of Foundry](https://github.com/lokashrinav/foundry) that adds passthrough recording APIs for tracking non-bump-allocator GPU allocations (NCCL, cuBLAS, PyTorch caching allocator). Upstream Foundry does not have these APIs.
+
+```bash
+git clone https://github.com/lokashrinav/foundry
+cd foundry
+
+# Patch for torch 2.10+ (c10::cuda::MemPool -> at::cuda::MemPool)
+sed -i 's|c10::cuda::MemPool|at::cuda::MemPool|g' csrc/CUDAGraph.cpp csrc/CUDAGraphParallel.cpp
+sed -i '/#include <c10\/cuda\/CUDACachingAllocator.h>/a #include <ATen/cuda/MemPool.h>' csrc/CUDAGraph.cpp csrc/CUDAGraphParallel.cpp
+
+pip install -e . --no-build-isolation
+```
 
 ## Project structure
 

@@ -69,13 +69,8 @@ image = (
     .run_commands(
         "pip install --upgrade pip 'setuptools>=80,<82' wheel",
     )
-    .add_local_dir(
-        "../foundry",
-        remote_path="/opt/foundry",
-        copy=True,
-    )
     .run_commands(
-        # Patch: c10::cuda::MemPool was moved to at::cuda::MemPool in torch 2.10+
+        "git clone https://github.com/lokashrinav/foundry /opt/foundry",
         "sed -i 's|c10::cuda::MemPool|at::cuda::MemPool|g'"
         " /opt/foundry/csrc/CUDAGraph.cpp /opt/foundry/csrc/CUDAGraphParallel.cpp",
         "sed -i '/#include <c10\\/cuda\\/CUDACachingAllocator.h>/a #include <ATen/cuda/MemPool.h>'"

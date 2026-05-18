@@ -50,7 +50,7 @@ image = (
         "pip install --upgrade pip 'setuptools>=80,<82' wheel",
     )
     .run_commands(
-        "git clone https://github.com/foundry-org/foundry /opt/foundry",
+        "git clone https://github.com/lokashrinav/foundry /opt/foundry",
         "sed -i 's|c10::cuda::MemPool|at::cuda::MemPool|g'"
         " /opt/foundry/csrc/CUDAGraph.cpp /opt/foundry/csrc/CUDAGraphParallel.cpp",
         "sed -i '/#include <c10\\/cuda\\/CUDACachingAllocator.h>/a #include <ATen/cuda/MemPool.h>'"
