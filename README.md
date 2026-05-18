@@ -130,11 +130,6 @@ This project requires a [fork of Foundry](https://github.com/lokashrinav/foundry
 ```bash
 git clone https://github.com/lokashrinav/foundry
 cd foundry
-
-# Patch for torch 2.10+ (c10::cuda::MemPool -> at::cuda::MemPool)
-sed -i 's|c10::cuda::MemPool|at::cuda::MemPool|g' csrc/CUDAGraph.cpp csrc/CUDAGraphParallel.cpp
-sed -i '/#include <c10\/cuda\/CUDACachingAllocator.h>/a #include <ATen/cuda/MemPool.h>' csrc/CUDAGraph.cpp csrc/CUDAGraphParallel.cpp
-
 pip install -e . --no-build-isolation
 ```
 
